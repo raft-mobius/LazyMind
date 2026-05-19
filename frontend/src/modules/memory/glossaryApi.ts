@@ -19,6 +19,12 @@ export interface ListGlossaryOptions {
   source?: GlossarySource;
 }
 
+export interface GlossaryAssetListResult {
+  records: GlossaryAsset[];
+  total: number;
+  nextPageToken: string;
+}
+
 export interface CheckGlossaryWordsResult {
   existing: string[];
 }
@@ -59,6 +65,19 @@ const toStringValue = (value: unknown, fallback = ""): string => {
   }
   if (typeof value === "number") {
     return String(value);
+  }
+  return fallback;
+};
+
+const toNumberValue = (value: unknown, fallback = 0): number => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
   }
   return fallback;
 };
@@ -277,9 +296,17 @@ const normalizeGlossaryConflictList = (payload: unknown): GlossaryConflict[] =>
 export async function listGlossaryAssets(
   options: ListGlossaryOptions = {},
 ): Promise<GlossaryAsset[]> {
+  const result = await listGlossaryAssetsPage(options);
+  return result.records;
+}
+
+export async function listGlossaryAssetsPage(
+  options: ListGlossaryOptions = {},
+): Promise<GlossaryAssetListResult> {
   const keyword = (options.keyword || "").trim();
   const pageSize = options.pageSize || defaultPageSize;
   const pageToken = options.pageToken || "";
+  let responseData: unknown;
 
   if (keyword || options.source) {
     const response = await axiosInstance.post(`${coreBasePath}/word_group:search`, {
@@ -288,16 +315,44 @@ export async function listGlossaryAssets(
       page_size: pageSize,
       page_token: pageToken,
     });
-    return normalizeGlossaryList(response.data);
+    responseData = response.data;
+  } else {
+    const response = await axiosInstance.get(`${coreBasePath}/word_group`, {
+      params: {
+        page_size: pageSize,
+        page_token: pageToken,
+      },
+    });
+    responseData = response.data;
   }
 
-  const response = await axiosInstance.get(`${coreBasePath}/word_group`, {
-    params: {
-      page_size: pageSize,
-      page_token: pageToken,
-    },
-  });
-  return normalizeGlossaryList(response.data);
+  const payload = unwrapEnvelope<unknown>(responseData);
+  const rawPayload = toRawObject(payload);
+  const rawEnvelope = toRawObject(responseData);
+  const records = normalizeGlossaryList(payload);
+  const totalCandidate =
+    rawPayload?.total_size ??
+    rawPayload?.totalSize ??
+    rawPayload?.total ??
+    rawEnvelope?.total_size ??
+    rawEnvelope?.totalSize ??
+    rawEnvelope?.total;
+  const nextPageToken = toStringValue(
+    rawPayload?.next_page_token ??
+      rawPayload?.nextPageToken ??
+      rawEnvelope?.next_page_token ??
+      rawEnvelope?.nextPageToken ??
+      "",
+  );
+
+  return {
+    records,
+    total:
+      totalCandidate === undefined || totalCandidate === null
+        ? records.length
+        : Math.max(0, toNumberValue(totalCandidate, records.length)),
+    nextPageToken,
+  };
 }
 
 export async function getGlossaryAssetDetail(groupId: string): Promise<GlossaryAsset | null> {
@@ -403,4 +458,43 @@ export async function addGlossaryConflictToGroups(
     word: conflict.word,
     group_ids: conflict.groupIds,
   });
+}
+
+export interface GlossaryConflictMergeGroupRequest {
+  group_ids: string[];
+  term: string;
+  aliases?: string[];
+  description: string;
+}
+
+export async function mergeGlossaryConflictAndAddWord(
+  payload: {
+    id: string;
+    word: string;
+    group_ids?: string[];
+    merges?: GlossaryConflictMergeGroupRequest[];
+  },
+): Promise<GlossaryAsset[]> {
+  const response = await axiosInstance.post(
+    `${coreBasePath}/word_group_conflict:mergeAndAddWord`,
+    payload,
+  );
+  const raw = toRawObject(unwrapEnvelope<unknown>(response.data));
+  const items = Array.isArray(raw?.items) ? raw.items : [];
+  return items
+    .map((item) => normalizeGlossaryAsset(item))
+    .filter((item): item is GlossaryAsset => Boolean(item));
+}
+
+export async function createGlossaryGroupFromConflict(
+  payload: {
+    id: string;
+    word: string;
+    term: string;
+    aliases?: string[];
+    description: string;
+    group_ids?: string[];
+  },
+): Promise<void> {
+  await axiosInstance.post(`${coreBasePath}/word_group_conflict:createGroup`, payload);
 }

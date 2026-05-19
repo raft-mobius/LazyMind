@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, Empty, Form, Input, Modal, Popconfirm, Select, Tag, Tooltip, message } from "antd";
+import { Button, Empty, Form, Input, Modal, Popconfirm, Select, Tag, Tooltip, message } from "antd";
 import { useTranslation } from "react-i18next";
 import {
   CheckCircleFilled,
@@ -172,6 +172,9 @@ const moduleConfigs: ModuleConfig[] = [
     subtitleKey: "modelProvider.module.selfEvolutionSubtitle",
   },
 ];
+
+const hiddenDefaultModuleKeys = new Set<ModelCapability>(["EMBEDDING"]);
+const visibleModuleConfigs = moduleConfigs.filter((module) => !hiddenDefaultModuleKeys.has(module.key));
 
 const builtInProviders: ProviderOption[] = [
   {
@@ -388,7 +391,7 @@ function getCapabilityByModelType(modelType?: string): ModelCapability | undefin
   if (selectedCapability) {
     return selectedCapability;
   }
-  return moduleConfigs.find((module) => selectedModelTypeByCapability[module.key].toLowerCase() === normalized)?.key;
+  return visibleModuleConfigs.find((module) => selectedModelTypeByCapability[module.key].toLowerCase() === normalized)?.key;
 }
 
 const createModelProviderFallbacks = (t: ReturnType<typeof useTranslation>["t"]) => ({
@@ -443,6 +446,7 @@ interface ApiGroup {
 
 interface CheckModelProviderResult {
   success: boolean;
+  message?: string;
 }
 
 interface ApiModel {
@@ -535,6 +539,18 @@ function mapApiGroup(
       enabled: true,
     })),
   });
+}
+
+function getCheckFailureMessage(checkResult?: CheckModelProviderResult): string | undefined {
+  if (!checkResult || typeof checkResult !== "object") {
+    return undefined;
+  }
+
+  if (typeof checkResult.message === "string" && checkResult.message.trim()) {
+    return checkResult.message.trim();
+  }
+
+  return undefined;
 }
 
 function ProviderLogo({ provider, compact = false }: { provider: ProviderOption; compact?: boolean }) {
@@ -1028,7 +1044,7 @@ export default function ModelProviderPage() {
         });
         return next;
       });
-      message.error(t("modelProvider.message.groupVerifyFailed"));
+      message.error(getCheckFailureMessage(checkResult) || t("modelProvider.message.groupVerifyFailed"));
     } catch (error) {
       message.error(getLocalizedErrorMessage(error, t("modelProvider.error.verifyFailed")));
     } finally {
@@ -1331,20 +1347,13 @@ export default function ModelProviderPage() {
           <section className="model-provider-config-panel" aria-label={t("modelProvider.defaultConfigAria")}>
             <div className="model-provider-panel-title-row">
               <div>
-                <h2>{t("modelProvider.defaultTitle")}</h2>
-                <p>{t("modelProvider.defaultSubtitle")}</p>
+                <h2 className="model-provider-section-title">{t("modelProvider.defaultTitle")}</h2>
+                <p className="model-provider-section-subtitle">{t("modelProvider.defaultSubtitle")}</p>
               </div>
             </div>
 
-            <Alert
-              className="model-provider-inline-alert"
-              message={t("modelProvider.embeddingLimitedAlert")}
-              showIcon
-              type="info"
-            />
-
             <div className="model-provider-default-list">
-              {moduleConfigs.map((module) => {
+              {visibleModuleConfigs.map((module) => {
                 const options = moduleModelOptions[module.key] || [];
                 const optionLoading = Boolean(moduleModelLoading[module.key]);
                 const moduleTitle = t(module.titleKey);
@@ -1425,8 +1434,8 @@ export default function ModelProviderPage() {
 
           <section className="model-provider-added-section">
             <div className="model-provider-panel-heading">
-              <h2>{t("modelProvider.myGroupsTitle")}</h2>
-              <p>{t("modelProvider.myGroupsSubtitle")}</p>
+              <h2 className="model-provider-section-title">{t("modelProvider.myGroupsTitle")}</h2>
+              <p className="model-provider-section-subtitle">{t("modelProvider.myGroupsSubtitle")}</p>
             </div>
 
             <div className="model-provider-added-list">
@@ -1601,8 +1610,8 @@ export default function ModelProviderPage() {
 
         <aside className="model-provider-side-panel" aria-label={t("modelProvider.builtInProvidersAria")}>
           <div className="model-provider-side-header">
-            <h2>{t("modelProvider.builtInProvidersTitle")}</h2>
-            <p>{t("modelProvider.builtInProvidersSubtitle")}</p>
+            <h2 className="model-provider-section-title">{t("modelProvider.builtInProvidersTitle")}</h2>
+            <p className="model-provider-section-subtitle">{t("modelProvider.builtInProvidersSubtitle")}</p>
           </div>
 
           <Input

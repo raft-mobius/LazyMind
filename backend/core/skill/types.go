@@ -1,16 +1,19 @@
 package skill
 
 type childSkillInput struct {
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	FileExt string `json:"file_ext"`
-	AutoEvo bool   `json:"auto_evo"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Tags        []string `json:"tags"`
+	Content     string   `json:"content"`
+	FileExt     string   `json:"file_ext"`
+	AutoEvo     bool     `json:"auto_evo"`
 }
 
 type createSkillRequest struct {
 	Name            string            `json:"name"`
 	Description     string            `json:"description"`
 	Category        string            `json:"category"`
+	ParentSkillID   string            `json:"parent_skill_id"`
 	ParentSkillName string            `json:"parent_skill_name"`
 	Tags            []string          `json:"tags"`
 	Content         string            `json:"content"`
@@ -21,14 +24,16 @@ type createSkillRequest struct {
 }
 
 type updateSkillRequest struct {
-	Name        *string   `json:"name"`
-	Description *string   `json:"description"`
-	Category    *string   `json:"category"`
-	Tags        *[]string `json:"tags"`
-	Content     *string   `json:"content"`
-	FileExt     *string   `json:"file_ext"`
-	AutoEvo     *bool     `json:"auto_evo"`
-	IsEnabled   *bool     `json:"is_enabled"`
+	Name            *string   `json:"name"`
+	Description     *string   `json:"description"`
+	Category        *string   `json:"category"`
+	ParentSkillID   *string   `json:"parent_skill_id"`
+	ParentSkillName *string   `json:"parent_skill_name"`
+	Tags            *[]string `json:"tags"`
+	Content         *string   `json:"content"`
+	FileExt         *string   `json:"file_ext"`
+	AutoEvo         *bool     `json:"auto_evo"`
+	IsEnabled       *bool     `json:"is_enabled"`
 }
 
 type generateSkillRequest struct {

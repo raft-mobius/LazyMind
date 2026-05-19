@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lazyrag/scan_control_plane/internal/model"
+	"github.com/lazymind/scan_control_plane/internal/model"
 )
 
 func inferDocumentUpdateType(desiredVersionID, currentVersionID, parseStatus string) string {
@@ -25,6 +25,38 @@ func inferDocumentUpdateType(desiredVersionID, currentVersionID, parseStatus str
 		return "UNCHANGED"
 	}
 	return "UNKNOWN"
+}
+
+func documentSettledForSnapshotNew(desiredVersionID, currentVersionID, parseStatus string, latestTask parseTaskDocJoin, hasLatestTask bool) bool {
+	if inferDocumentUpdateType(desiredVersionID, currentVersionID, parseStatus) == "UNCHANGED" {
+		return true
+	}
+	if !hasLatestTask {
+		return false
+	}
+	targetVersion := strings.TrimSpace(latestTask.TargetVersionID)
+	desiredVersion := strings.TrimSpace(desiredVersionID)
+	if targetVersion == "" || desiredVersion == "" || targetVersion != desiredVersion {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(latestTask.ScanOrchestrationStatus)) {
+	case "SUCCEEDED", "SUCCESS", "COMPLETED", "DONE", "FINISHED":
+		return true
+	}
+	switch strings.ToUpper(strings.TrimSpace(latestTask.Status)) {
+	case "SUCCEEDED", "SUCCESS", "COMPLETED", "DONE", "FINISHED":
+		return true
+	default:
+		return false
+	}
+}
+
+func effectiveDocumentUpdateType(desiredVersionID, currentVersionID, parseStatus string, latestTask parseTaskDocJoin, hasLatestTask bool) string {
+	updateType := inferDocumentUpdateType(desiredVersionID, currentVersionID, parseStatus)
+	if updateType == "NEW" && documentSettledForSnapshotNew(desiredVersionID, currentVersionID, parseStatus, latestTask, hasLatestTask) {
+		return "UNCHANGED"
+	}
+	return updateType
 }
 
 func InferDocumentUpdateType(desiredVersionID, currentVersionID, parseStatus string) string {
@@ -65,6 +97,8 @@ func toModelParseTaskListItem(row parseTaskListRow) model.ParseTaskListItem {
 		TenantID:                row.TenantID,
 		SourceID:                row.SourceID,
 		SourceName:              row.SourceName,
+		SourceCreateUserID:      strings.TrimSpace(row.SourceCreateUserID),
+		SourceCreateUserName:    strings.TrimSpace(row.SourceCreateUserName),
 		DocumentID:              row.DocumentID,
 		SourceObjectID:          row.SourceObjectID,
 		TaskAction:              normalizeTaskAction(row.TaskAction),
@@ -98,6 +132,8 @@ func toModelParseTaskDetail(row parseTaskDetailRow) model.ParseTaskDetailRespons
 		TenantID:                row.TenantID,
 		SourceID:                row.SourceID,
 		SourceName:              row.SourceName,
+		SourceCreateUserID:      strings.TrimSpace(row.SourceCreateUserID),
+		SourceCreateUserName:    strings.TrimSpace(row.SourceCreateUserName),
 		DocumentID:              row.DocumentID,
 		SourceObjectID:          row.SourceObjectID,
 		TaskAction:              normalizeTaskAction(row.TaskAction),
@@ -225,6 +261,7 @@ func toModelSource(e sourceEntity) model.Source {
 	return model.Source{
 		ID:                    e.ID,
 		TenantID:              e.TenantID,
+		CreateUserID:          strings.TrimSpace(e.CreateUserID),
 		Name:                  e.Name,
 		SourceType:            e.SourceType,
 		RootPath:              e.RootPath,

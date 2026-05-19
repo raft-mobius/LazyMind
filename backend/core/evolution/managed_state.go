@@ -9,15 +9,15 @@ import (
 
 	"gorm.io/gorm"
 
-	"lazyrag/core/algo"
-	"lazyrag/core/common"
-	"lazyrag/core/common/orm"
-	"lazyrag/core/store"
+	"lazymind/core/algo"
+	"lazymind/core/common"
+	"lazymind/core/common/orm"
+	"lazymind/core/store"
 )
 
 const (
-	ManagedMemoryTitle     = "回复风格偏好"
-	ManagedPreferenceTitle = "输出结构偏好"
+	ManagedMemoryTitle     = "智能体工作记忆"
+	ManagedPreferenceTitle = "用户画像"
 )
 
 type ManagedStateItem struct {
@@ -98,7 +98,7 @@ func NewManagedStateItem(resourceType string, row any, suggestionStatus string) 
 	item := ManagedStateItem{
 		ResourceType:                strings.TrimSpace(resourceType),
 		Title:                       ManagedStateTitle(resourceType),
-		HasPendingReviewSuggestions: suggestionStatus == SuggestionStatusPendingReview,
+		HasPendingReviewSuggestions: suggestionStatus != SuggestionStatusNone,
 		SuggestionStatus:            suggestionStatus,
 	}
 	switch typed := row.(type) {
@@ -181,7 +181,7 @@ func ManagedStateSummary(content string) string {
 }
 
 func applyManagedMemoryAutoEvolution(ctx context.Context, db *gorm.DB, row orm.SystemMemory) (bool, error) {
-	pending, err := LoadPendingReviewSuggestions(ctx, db, row.UserID, ResourceTypeMemory, SystemResourceKey(ResourceTypeMemory))
+	pending, err := LoadAutoApplicableSuggestions(ctx, db, row.UserID, ResourceTypeMemory, SystemResourceKey(ResourceTypeMemory))
 	if err != nil {
 		return false, err
 	}
@@ -225,7 +225,7 @@ func applyManagedMemoryAutoEvolution(ctx context.Context, db *gorm.DB, row orm.S
 }
 
 func applyManagedPreferenceAutoEvolution(ctx context.Context, db *gorm.DB, row orm.SystemUserPreference) (bool, error) {
-	pending, err := LoadPendingReviewSuggestions(ctx, db, row.UserID, ResourceTypeUserPreference, SystemResourceKey(ResourceTypeUserPreference))
+	pending, err := LoadAutoApplicableSuggestions(ctx, db, row.UserID, ResourceTypeUserPreference, SystemResourceKey(ResourceTypeUserPreference))
 	if err != nil {
 		return false, err
 	}
@@ -290,7 +290,7 @@ func EnsureManagedMemoryAutoEvolutionScheduled(row orm.SystemMemory) error {
 		ReleaseAutoEvoWorker(workerKey)
 		return nil
 	}
-	pending, err := LoadPendingReviewSuggestions(context.Background(), db, latest.UserID, ResourceTypeMemory, SystemResourceKey(ResourceTypeMemory))
+	pending, err := LoadAutoApplicableSuggestions(context.Background(), db, latest.UserID, ResourceTypeMemory, SystemResourceKey(ResourceTypeMemory))
 	if err != nil {
 		ReleaseAutoEvoWorker(workerKey)
 		return err
@@ -340,7 +340,7 @@ func EnsureManagedPreferenceAutoEvolutionScheduled(row orm.SystemUserPreference)
 		ReleaseAutoEvoWorker(workerKey)
 		return nil
 	}
-	pending, err := LoadPendingReviewSuggestions(context.Background(), db, latest.UserID, ResourceTypeUserPreference, SystemResourceKey(ResourceTypeUserPreference))
+	pending, err := LoadAutoApplicableSuggestions(context.Background(), db, latest.UserID, ResourceTypeUserPreference, SystemResourceKey(ResourceTypeUserPreference))
 	if err != nil {
 		ReleaseAutoEvoWorker(workerKey)
 		return err
@@ -383,7 +383,7 @@ func runManagedMemoryAutoEvolutionLoop(memoryID, workerKey string) {
 		if !row.AutoEvo {
 			return
 		}
-		pending, err := LoadPendingReviewSuggestions(ctx, db, row.UserID, ResourceTypeMemory, SystemResourceKey(ResourceTypeMemory))
+		pending, err := LoadAutoApplicableSuggestions(ctx, db, row.UserID, ResourceTypeMemory, SystemResourceKey(ResourceTypeMemory))
 		if err != nil {
 			_ = db.WithContext(ctx).Model(&orm.SystemMemory{}).Where("id = ?", row.ID).Updates(map[string]any{
 				"auto_evo_apply_status": AutoEvoApplyStatusFailed,
@@ -443,7 +443,7 @@ func runManagedPreferenceAutoEvolutionLoop(preferenceID, workerKey string) {
 		if !row.AutoEvo {
 			return
 		}
-		pending, err := LoadPendingReviewSuggestions(ctx, db, row.UserID, ResourceTypeUserPreference, SystemResourceKey(ResourceTypeUserPreference))
+		pending, err := LoadAutoApplicableSuggestions(ctx, db, row.UserID, ResourceTypeUserPreference, SystemResourceKey(ResourceTypeUserPreference))
 		if err != nil {
 			_ = db.WithContext(ctx).Model(&orm.SystemUserPreference{}).Where("id = ?", row.ID).Updates(map[string]any{
 				"auto_evo_apply_status": AutoEvoApplyStatusFailed,

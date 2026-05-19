@@ -10,6 +10,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   message,
 } from "antd";
@@ -30,14 +31,16 @@ import {
   Configuration as ScanConfiguration,
   DefaultApi as ScanDefaultApi,
   type Agent as ScanAgent,
-  type CloudSourceBinding,
   type Source as ScanSource,
+  type CloudSourceBinding,
+  type SourceDocumentItem as ScanSourceDocumentItem,
 } from "@/api/generated/scan-client";
 import {
   Configuration as CoreConfiguration,
+  DatasetsApi as CoreDatasetsApi,
   DefaultApi as CoreDefaultApi,
+  type Dataset as CoreDataset,
 } from "@/api/generated/core-client";
-import { AgentAppsAuth } from "@/components/auth";
 import { BASE_URL, axiosInstance, getLocalizedErrorMessage } from "@/components/request";
 
 import "./index.scss";
@@ -46,6 +49,7 @@ import DataSourceSummaryCards from "./components/DataSourceSummaryCards";
 import DataSourceWizardModal from "./components/DataSourceWizardModal";
 import {
   FEISHU_DATA_SOURCE_OAUTH_CHANNEL,
+  clearFeishuDataSourceWizardDraft,
   consumeFeishuDataSourceOAuthResult,
   consumeFeishuDataSourceWizardDraft,
   finishFeishuDataSourceOAuth,
@@ -83,6 +87,8 @@ import {
   getSyncModeLabel,
   isCloudType,
   normalizeDataSourceConnectionState,
+  normalizeDataSourceFileUpdateState,
+  normalizeDataSourceParseStatus,
   normalizeDataSourceStatus,
 } from "./shared";
 
@@ -97,6 +103,14 @@ function normalizeScheduleTime(scheduleTime?: string) {
     return `${value}:00`;
   }
   return SCHEDULE_TIME_PATTERN.test(value) ? value : DEFAULT_SCHEDULE_TIME;
+}
+
+function normalizeKnowledgeBaseName(value?: string) {
+  return `${value || ""}`.trim().toLowerCase();
+}
+
+function getDatasetDisplayName(dataset: CoreDataset) {
+  return `${dataset.display_name || dataset.name || ""}`.trim();
 }
 
 const sourceTypeOptions: Array<{
@@ -143,12 +157,49 @@ function createCoreApiClient() {
   );
 }
 
+function createCoreDatasetsApiClient() {
+  const baseUrl = BASE_URL || window.location.origin;
+  return new CoreDatasetsApi(
+    new CoreConfiguration({
+      basePath: baseUrl,
+      baseOptions: {
+        headers: { "Content-Type": "application/json" },
+      },
+    }),
+    baseUrl,
+    axiosInstance,
+  );
+}
+
 function listScanAgents(client: ScanDefaultApi) {
   return client.apiScanAgentsGet({
     params: {
       tenant_id: DEFAULT_SCAN_TENANT_ID,
     },
   });
+}
+
+async function listKnowledgeBaseNames(client = createCoreDatasetsApiClient()) {
+  const names: string[] = [];
+  let pageToken: string | undefined;
+
+  for (let pageIndex = 0; pageIndex < 20; pageIndex += 1) {
+    const response = await client.apiCoreDatasetsGet({
+      pageToken,
+      pageSize: 200,
+    });
+    names.push(
+      ...(response.data.datasets || []).map(getDatasetDisplayName).filter(Boolean),
+    );
+
+    const nextPageToken = response.data.next_page_token || "";
+    if (!nextPageToken || nextPageToken === pageToken) {
+      break;
+    }
+    pageToken = nextPageToken;
+  }
+
+  return names;
 }
 
 function sleep(ms: number) {
@@ -192,45 +243,6 @@ async function waitForCloudSyncRun(
   throw new Error("等待飞书目录同步超时，请稍后重试。");
 }
 
-function getFetchErrorMessage(payload: any, fallback: string) {
-  if (typeof payload?.message === "string" && payload.message.trim()) {
-    return payload.message;
-  }
-  if (typeof payload?.detail === "string" && payload.detail.trim()) {
-    return payload.detail;
-  }
-  return fallback;
-}
-
-function getFetchHeaders() {
-  return {
-    Accept: "application/json",
-    ...AgentAppsAuth.getAuthHeaders(),
-  };
-}
-
-async function fetchFeishuCloudBinding(sourceId: string) {
-  const baseUrl = BASE_URL || window.location.origin;
-  const response = await fetch(
-    `${baseUrl}/api/scan/sources/${encodeURIComponent(sourceId)}/cloud/binding`,
-    {
-      credentials: "include",
-      headers: getFetchHeaders(),
-    },
-  );
-
-  if (response.status === 404) {
-    return null;
-  }
-
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(getFetchErrorMessage(payload, "获取飞书绑定信息失败。"));
-  }
-
-  return payload as CloudSourceBinding;
-}
-
 function isFeishuScanSource(source: ScanSource) {
   const originPlatform = (source.default_origin_platform || "").toUpperCase();
   const originType = (source.default_origin_type || "").toUpperCase();
@@ -254,6 +266,10 @@ function parseFeishuScheduleExpr(expr?: string) {
   if (!trimmed) {
     return null;
   }
+  const normalized = trimmed.toLowerCase();
+  if (normalized === "manual" || normalized === "manual_only") {
+    return null;
+  }
 
   const dailyMatch = trimmed.match(/^daily@(([01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?)$/i);
   if (dailyMatch) {
@@ -273,6 +289,10 @@ function parseFeishuScheduleExpr(expr?: string) {
 
 function buildFeishuScheduleExpr(scheduleTime?: string) {
   return `daily@${normalizeScheduleTime(scheduleTime)}`;
+}
+
+function buildFeishuManualScheduleExpr() {
+  return "manual";
 }
 
 function buildFeishuScheduleLabel(binding: CloudSourceBinding | null, t: TFunction) {
@@ -316,6 +336,33 @@ function mapScanSyncDetail(updateState: FileUpdateState) {
     return "源端删除待清理";
   }
   return "当前文件已是最新";
+}
+
+function mapScanDocumentToDetail(item: ScanSourceDocumentItem): DetailDocumentItem {
+  const updateState = normalizeDataSourceFileUpdateState(
+    item.update_type,
+    item.has_update,
+  );
+  const parseState = [
+    item.parse_state,
+    item.core_task_state,
+    item.scan_orchestration_status,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const lastSyncedAt = formatDateTime(item.last_synced_at);
+  return {
+    id: `${item.document_id}`,
+    name: item.name,
+    path: item.path,
+    size: formatBytes(item.size_bytes),
+    tags: item.tags || [],
+    updateState,
+    syncDetail: item.update_desc || mapScanSyncDetail(updateState),
+    parseStatus: normalizeDataSourceParseStatus(parseState),
+    sourceUpdatedAt: lastSyncedAt,
+    updatedAt: lastSyncedAt,
+  };
 }
 
 function getReconcileSeconds(scheduleCycle?: string) {
@@ -472,8 +519,10 @@ export default function DataSourceManagement() {
   const [manualOauthSubmitting, setManualOauthSubmitting] = useState(false);
   const oauthAttemptRef = useRef<PendingOAuthAttempt | null>(null);
   const [scanAgents, setScanAgents] = useState<ScanAgent[]>([]);
+  const [knowledgeBaseNames, setKnowledgeBaseNames] = useState<string[]>([]);
   const [scanLoading, setScanLoading] = useState(false);
   const [validatedAgentId, setValidatedAgentId] = useState<string | null>(null);
+  const [wizardSaving, setWizardSaving] = useState(false);
 
   const syncMode = Form.useWatch("syncMode", form) || "scheduled";
   const feishuTargetType = (Form.useWatch("targetType", form) || "wiki_space") as FeishuTargetType;
@@ -520,10 +569,10 @@ export default function DataSourceManagement() {
 
   const mapScanSourceToDataSource = (
     source: ScanSource,
-    documentsPayload: any | null,
-    binding: CloudSourceBinding | null,
     fallback?: DataSourceItem,
+    binding: CloudSourceBinding | null = source.cloud_binding || null,
   ): DataSourceItem => {
+    const documentsPayload = source.documents;
     const summary = documentsPayload?.summary;
     const documentsSource = documentsPayload?.source;
     const isFeishuSource = isFeishuScanSource(source);
@@ -535,8 +584,19 @@ export default function DataSourceManagement() {
     const currentTime = formatDateTime(
       documentsSource?.last_synced_at || binding?.updated_at || source.updated_at,
     );
-    const fallbackDetailDocuments = fallback?.detailDocuments || [];
-    const fallbackFileCandidates = fallback?.fileCandidates || [];
+    const detailDocuments = documentsPayload?.items
+      ? documentsPayload.items.map(mapScanDocumentToDetail)
+      : fallback?.detailDocuments || [];
+    const fileCandidates = documentsPayload?.items
+      ? detailDocuments.map((item) => ({
+        id: item.id,
+        name: item.name,
+        path: item.path,
+        size: item.size,
+        type: item.path.split(".").pop() || "",
+        updateState: item.updateState,
+      }))
+      : fallback?.fileCandidates || [];
     const documentCount = summary?.total_document_count ?? fallback?.documentCount ?? 0;
     const addCount = summary?.new_count ?? fallback?.addCount ?? 0;
     const deleteCount = summary?.deleted_count ?? fallback?.deleteCount ?? 0;
@@ -569,7 +629,7 @@ export default function DataSourceManagement() {
         enabled: Boolean(binding?.enabled ?? true),
         scopeMode: "all",
         selectedFiles: [],
-        fileCandidates: fallbackFileCandidates,
+        fileCandidates,
         logs: [
           {
             id: `scan-log-${source.id}-${binding?.updated_at || source.updated_at}`,
@@ -603,10 +663,11 @@ export default function DataSourceManagement() {
           typeof summary?.storage_bytes === "number"
             ? formatBytes(summary.storage_bytes)
             : fallback?.storageUsed || "0 B",
-        detailDocuments: fallbackDetailDocuments,
+        detailDocuments,
         rootPath: source.root_path,
         targetRef: binding?.target_ref || fallback?.targetRef,
         targetType: (binding?.target_type as FeishuTargetType | undefined) || fallback?.targetType,
+        authConnectionId: binding?.auth_connection_id || fallback?.authConnectionId,
         datasetId: source.dataset_id,
       };
     }
@@ -633,7 +694,7 @@ export default function DataSourceManagement() {
       enabled: sourceStatus === "active",
       scopeMode: "all",
       selectedFiles: [],
-      fileCandidates: fallbackFileCandidates,
+      fileCandidates,
       logs: [
         {
           id: `scan-log-${source.id}-${source.updated_at}`,
@@ -659,7 +720,7 @@ export default function DataSourceManagement() {
       tenantId: source.tenant_id,
       scanManaged: true,
       storageUsed,
-      detailDocuments: fallbackDetailDocuments,
+      detailDocuments,
       rootPath: source.root_path,
       datasetId: source.dataset_id,
     };
@@ -669,43 +730,17 @@ export default function DataSourceManagement() {
     const client = createScanApiClient();
     setScanLoading(true);
     try {
-      const [agentsResponse, sourcesResponse] = await Promise.all([
-        listScanAgents(client),
-        client.apiScanSourcesGet(),
-      ]);
-      const nextAgents = agentsResponse.data.items || [];
-      setScanAgents(nextAgents);
+      const sourcesResponse = await client.apiScanSourcesGet();
 
       const sourceList = sourcesResponse.data.items || [];
       const previousSourceMap = new Map(
         sources.map((item) => [item.id, item]),
       );
-      const nextSources = await Promise.all(
-        sourceList.map(async (source) => {
-          const [documentsResponse, binding] = await Promise.all([
-            source.tenant_id
-              ? client
-                  .apiScanSourcesIdDocumentsGet({
-                    id: source.id,
-                    tenantId: source.tenant_id,
-                    page: 1,
-                    pageSize: 1,
-                  })
-                  .then((response) => response.data)
-                  .catch(() => null)
-              : Promise.resolve(null),
-            isFeishuScanSource(source)
-              ? fetchFeishuCloudBinding(source.id).catch(() => null)
-              : Promise.resolve(null),
-          ]);
-
-          return mapScanSourceToDataSource(
-            source,
-            documentsResponse,
-            binding,
-            previousSourceMap.get(source.id),
-          );
-        }),
+      const nextSources = sourceList.map((source) =>
+        mapScanSourceToDataSource(
+          source,
+          previousSourceMap.get(source.id),
+        ),
       );
 
       setSources(nextSources);
@@ -724,6 +759,14 @@ export default function DataSourceManagement() {
       }
     } finally {
       setScanLoading(false);
+    }
+  };
+
+  const refreshKnowledgeBaseNames = async () => {
+    try {
+      setKnowledgeBaseNames(await listKnowledgeBaseNames());
+    } catch (error) {
+      console.error("Failed to refresh knowledge base names", error);
     }
   };
 
@@ -842,7 +885,13 @@ export default function DataSourceManagement() {
 
   useEffect(() => {
     void refreshSources(false);
+    void refreshKnowledgeBaseNames();
   }, []);
+
+  const getKnownKnowledgeBaseNames = () => [
+    ...knowledgeBaseNames,
+    ...sources.map((item) => item.knowledgeBase),
+  ];
 
   const resetWizard = () => {
     form.resetFields();
@@ -918,6 +967,7 @@ export default function DataSourceManagement() {
 
   const handleCloseWizard = () => {
     setWizardOpen(false);
+    clearFeishuDataSourceWizardDraft();
     resetWizard();
   };
 
@@ -1094,6 +1144,21 @@ export default function DataSourceManagement() {
         returnUrl: window.location.href,
       });
 
+      const draft: FeishuDataSourceWizardDraft = {
+        wizardOpen: true,
+        wizardStep,
+        wizardMode,
+        selectedType,
+        editingId,
+        validatedAgentId: selectedAgent.agent_id,
+        oauthState: "waiting",
+        connectionVerified: previousVerified,
+        oauthConnection: previousConnection,
+        formValues: form.getFieldsValue(true),
+      };
+
+      saveFeishuDataSourceWizardDraft(draft);
+
       const popup = openCenteredPopup(authorizeUrl, t("admin.dataSourceFeishuAuthWindowTitle"));
 
       oauthAttemptRef.current = {
@@ -1123,20 +1188,6 @@ export default function DataSourceManagement() {
         return;
       }
 
-      const draft: FeishuDataSourceWizardDraft = {
-        wizardOpen: true,
-        wizardStep,
-        wizardMode,
-        selectedType,
-        editingId,
-        validatedAgentId: selectedAgent.agent_id,
-        oauthState: "waiting",
-        connectionVerified: previousVerified,
-        oauthConnection: previousConnection,
-        formValues: form.getFieldsValue(true),
-      };
-
-      saveFeishuDataSourceWizardDraft(draft);
       window.location.assign(authorizeUrl);
     } catch (error: any) {
       setOauthState(previousState);
@@ -1234,6 +1285,39 @@ export default function DataSourceManagement() {
     if (!connectionVerified) {
       message.warning(t("admin.dataSourceTestConnectionFirst"));
       return false;
+    }
+
+    return true;
+  };
+
+  const ensureKnowledgeBaseNameUnique = async (value?: string) => {
+    if (wizardMode === "edit") {
+      return true;
+    }
+
+    const normalizedValue = normalizeKnowledgeBaseName(value);
+    if (!normalizedValue) {
+      return false;
+    }
+
+    const duplicateMessage = t("admin.dataSourceKnowledgeBaseNameDuplicated");
+    const knownNameSet = new Set(
+      getKnownKnowledgeBaseNames().map(normalizeKnowledgeBaseName).filter(Boolean),
+    );
+    if (knownNameSet.has(normalizedValue)) {
+      form.setFields([{ name: "knowledgeBase", errors: [duplicateMessage] }]);
+      return false;
+    }
+
+    try {
+      const latestNames = await listKnowledgeBaseNames();
+      setKnowledgeBaseNames(latestNames);
+      if (latestNames.map(normalizeKnowledgeBaseName).includes(normalizedValue)) {
+        form.setFields([{ name: "knowledgeBase", errors: [duplicateMessage] }]);
+        return false;
+      }
+    } catch (error) {
+      console.error("Failed to validate knowledge base name", error);
     }
 
     return true;
@@ -1372,6 +1456,49 @@ export default function DataSourceManagement() {
     }
   };
 
+  const validateFeishuTargetBeforeSave = async (
+    client: ScanDefaultApi,
+    authConnectionId: string,
+    targetType: FeishuTargetType,
+    targetRef: string,
+  ) => {
+    try {
+      const response = await client.apiScanCloudTargetValidatePost({
+        validateCloudTargetRequest: {
+          provider: "feishu",
+          auth_connection_id: authConnectionId,
+          target_type: targetType,
+          target_ref: targetRef,
+        },
+      });
+
+      if (response.data.valid) {
+        return true;
+      }
+
+      const validation = response.data as typeof response.data & {
+        reason?: string;
+        message?: string;
+        detail?: string;
+      };
+      const errorMessage =
+        validation.reason ||
+        validation.message ||
+        validation.detail ||
+        t("admin.dataSourceFeishuTargetValidateFailed");
+      form.setFields([{ name: "target", errors: [errorMessage] }]);
+      message.error(errorMessage);
+      return false;
+    } catch (error) {
+      const errorMessage =
+        getLocalizedErrorMessage(error, t("admin.dataSourceFeishuTargetValidateFailed")) ||
+        t("admin.dataSourceFeishuTargetValidateFailed");
+      form.setFields([{ name: "target", errors: [errorMessage] }]);
+      message.error(errorMessage);
+      return false;
+    }
+  };
+
   const handleSaveFeishuSource = async (values: SourceFormValues) => {
     const sourceName = `${values.knowledgeBase || getSourceTypeTitle("feishu", t)}`.trim();
     const targetRef = `${values.target || ""}`.trim();
@@ -1381,7 +1508,10 @@ export default function DataSourceManagement() {
         ? sources.find((item) => item.id === editingId && item.type === "feishu")
         : undefined;
 
-    if (!oauthConnection?.connectionId) {
+    const authConnectionId =
+      oauthConnection?.connectionId || (wizardMode === "edit" ? currentFeishuSource?.authConnectionId : "");
+
+    if (!authConnectionId) {
       message.warning(t("admin.dataSourceTestConnectionFirst"));
       return;
     }
@@ -1409,6 +1539,16 @@ export default function DataSourceManagement() {
     }
 
     try {
+      const targetValid = await validateFeishuTargetBeforeSave(
+        client,
+        authConnectionId,
+        targetType,
+        targetRef,
+      );
+      if (!targetValid) {
+        return;
+      }
+
       let sourceId = currentFeishuSource?.id || "";
       if (currentFeishuSource?.scanManaged) {
         await client.apiScanSourcesIdPut({
@@ -1468,7 +1608,7 @@ export default function DataSourceManagement() {
         upsertCloudSourceBindingRequest: {
           provider: "feishu",
           enabled: true,
-          auth_connection_id: oauthConnection.connectionId,
+          auth_connection_id: authConnectionId,
           target_type: targetType,
           target_ref: targetRef,
           reconcile_after_sync: true,
@@ -1481,7 +1621,10 @@ export default function DataSourceManagement() {
                 schedule_expr: buildFeishuScheduleExpr(values.scheduleTime),
                 schedule_tz: "Asia/Shanghai",
               }
-            : {}),
+            : {
+                schedule_expr: buildFeishuManualScheduleExpr(),
+                schedule_tz: "Asia/Shanghai",
+              }),
         },
       });
 
@@ -1509,21 +1652,44 @@ export default function DataSourceManagement() {
   };
 
   const handleSave = async () => {
-    if (!selectedType) {
+    if (!selectedType || wizardSaving) {
       return;
     }
 
-    await form.validateFields();
-    if (!validateConnectionBeforeSave()) {
-      return;
-    }
+    setWizardSaving(true);
+    try {
+      const syncStrategyFields =
+        form.getFieldValue("syncMode") === "scheduled"
+          ? ["syncMode", "scheduleCycle", "scheduleTime"]
+          : ["syncMode"];
 
-    const values = form.getFieldsValue();
-    if (selectedType === "local") {
-      await handleSaveLocalSource(values);
-      return;
+      if (wizardMode === "edit") {
+        await form.validateFields(syncStrategyFields);
+      } else {
+        await form.validateFields();
+      }
+
+      const values = form.getFieldsValue(true);
+
+      if (
+        wizardMode !== "edit" &&
+        !(await ensureKnowledgeBaseNameUnique(values.knowledgeBase))
+      ) {
+        return;
+      }
+
+      if (wizardMode !== "edit" && !validateConnectionBeforeSave()) {
+        return;
+      }
+
+      if (selectedType === "local") {
+        await handleSaveLocalSource(values);
+        return;
+      }
+      await handleSaveFeishuSource(values);
+    } finally {
+      setWizardSaving(false);
     }
-    await handleSaveFeishuSource(values);
   };
 
   const columns: ColumnsType<DataSourceItem> = [
@@ -1545,9 +1711,15 @@ export default function DataSourceManagement() {
             >
               {record.name}
             </Button>
-            <Text type="secondary" className="data-source-ellipsis">
-              {record.description}
-            </Text>
+            <Tooltip title={record.description} placement="topLeft">
+              <Text
+                type="secondary"
+                className="data-source-ellipsis"
+                tabIndex={0}
+              >
+                {record.description}
+              </Text>
+            </Tooltip>
           </div>
         </div>
       ),
@@ -1786,6 +1958,7 @@ export default function DataSourceManagement() {
         wizardOpen={wizardOpen}
         wizardStep={wizardStep}
         form={form}
+        existingKnowledgeBaseNames={getKnownKnowledgeBaseNames()}
         selectedType={selectedType}
         isFeishuSetupReady={isFeishuSetupReady}
         oauthState={oauthState}
@@ -1793,6 +1966,7 @@ export default function DataSourceManagement() {
         connectionVerified={connectionVerified}
         syncMode={syncMode}
         feishuTargetType={feishuTargetType}
+        saving={wizardSaving}
         onClose={handleCloseWizard}
         onPrev={() => setWizardStep((step) => step - 1)}
         onNext={handleNextStep}

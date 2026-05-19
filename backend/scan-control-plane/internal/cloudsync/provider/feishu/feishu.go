@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lazyrag/scan_control_plane/internal/cloudsync/provider"
+	"github.com/lazymind/scan_control_plane/internal/cloudsync/provider"
 	"go.uber.org/zap"
 )
 
@@ -22,6 +22,12 @@ type Provider struct {
 	baseURL string
 	client  *http.Client
 	log     *zap.Logger
+}
+
+type wikiListTarget struct {
+	SpaceID   string
+	Root      map[string]any
+	RootToken string
 }
 
 func New(timeout time.Duration) *Provider {
@@ -45,6 +51,32 @@ func NewWithLogger(timeout time.Duration, logger *zap.Logger) *Provider {
 }
 
 func (p *Provider) Name() string { return "feishu" }
+
+func (p *Provider) ValidateTarget(ctx context.Context, req provider.ListRequest) error {
+	accessToken := strings.TrimSpace(req.AccessToken)
+	if accessToken == "" {
+		return fmt.Errorf("feishu access_token is empty")
+	}
+	targetType := strings.ToLower(strings.TrimSpace(req.TargetType))
+	targetRef := strings.TrimSpace(req.TargetRef)
+	switch targetType {
+	case "wiki_space", "wiki":
+		if targetRef == "" {
+			targetRef = strings.TrimSpace(stringOption(req.ProviderOptions, "space_id"))
+		}
+		if targetRef == "" {
+			return fmt.Errorf("feishu wiki target_ref(space_id) is required")
+		}
+		return p.validateWikiTarget(ctx, accessToken, targetRef)
+	case "drive_folder", "folder":
+		if targetRef == "" {
+			targetRef = strings.TrimSpace(stringOption(req.ProviderOptions, "folder_token"))
+		}
+		return p.validateDriveTarget(ctx, accessToken, targetRef)
+	default:
+		return p.validateDriveTarget(ctx, accessToken, targetRef)
+	}
+}
 
 func (p *Provider) ListObjects(ctx context.Context, req provider.ListRequest) ([]provider.RemoteObject, error) {
 	accessToken := strings.TrimSpace(req.AccessToken)
@@ -70,7 +102,7 @@ func (p *Provider) ListObjects(ctx context.Context, req provider.ListRequest) ([
 		}
 		if p.log != nil {
 			p.log.Info("feishu list wiki space resolved",
-				zap.String("space_id", targetRef),
+				zap.String("target_ref", targetRef),
 			)
 		}
 		return p.listWikiSpace(ctx, accessToken, targetRef)
@@ -130,7 +162,37 @@ func (p *Provider) DownloadObject(ctx context.Context, accessToken string, objec
 	}
 }
 
+func (p *Provider) validateWikiTarget(ctx context.Context, accessToken, targetRef string) error {
+	target, err := p.resolveWikiListTarget(ctx, accessToken, targetRef)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(target.SpaceID) == "" {
+		return fmt.Errorf("feishu wiki target_ref resolved without space_id")
+	}
+	if len(target.Root) > 0 {
+		return nil
+	}
+	var data struct {
+		Items []map[string]any `json:"items"`
+		Nodes []map[string]any `json:"nodes"`
+	}
+	return p.getJSON(ctx, accessToken, "/wiki/v2/spaces/"+url.PathEscape(target.SpaceID)+"/nodes", map[string]string{"page_size": "1"}, &data)
+}
+
+func (p *Provider) validateDriveTarget(ctx context.Context, accessToken, folderToken string) error {
+	params := map[string]string{"page_size": "1"}
+	if normalized := normalizeFeishuTargetRef(folderToken); normalized != "" {
+		params["folder_token"] = normalized
+	}
+	var data struct {
+		Files []map[string]any `json:"files"`
+	}
+	return p.getJSON(ctx, accessToken, "/drive/v1/files", params, &data)
+}
+
 func (p *Provider) listDrive(ctx context.Context, accessToken, rootFolderToken string) ([]provider.RemoteObject, error) {
+	rootFolderToken = normalizeFeishuTargetRef(rootFolderToken)
 	visited := make(map[string]struct{}, 64)
 	out := make([]provider.RemoteObject, 0, 512)
 	if p.log != nil {
@@ -189,14 +251,23 @@ func (p *Provider) walkDriveFolder(
 			rawType = strings.TrimSpace(valueAsString(item["file_type"]))
 		}
 		currentPath := joinPath(parentPath, name)
-		mod := parseFeishuTime(valueAsString(item["modified_time"]))
-		if mod == nil {
-			mod = parseFeishuTime(valueAsString(item["edit_time"]))
-		}
+		mod := parseFirstFeishuTime(
+			valueAsString(item["modified_time"]),
+			valueAsString(item["edit_time"]),
+			valueAsString(item["updated_time"]),
+			valueAsString(item["update_time"]),
+			valueAsString(item["file_modified_time"]),
+			valueAsString(item["file_edit_time"]),
+			valueAsString(item["revision"]),
+		)
 		version := firstNonEmptyString(
 			valueAsString(item["revision"]),
 			valueAsString(item["modified_time"]),
 			valueAsString(item["edit_time"]),
+			valueAsString(item["updated_time"]),
+			valueAsString(item["update_time"]),
+			valueAsString(item["file_modified_time"]),
+			valueAsString(item["file_edit_time"]),
 		)
 		size := valueAsInt64(item["size"])
 		isDir := strings.EqualFold(rawType, "folder")
@@ -269,24 +340,76 @@ func (p *Provider) listDriveFiles(ctx context.Context, accessToken, folderToken 
 	return out, nil
 }
 
-func (p *Provider) listWikiSpace(ctx context.Context, accessToken, spaceID string) ([]provider.RemoteObject, error) {
+func (p *Provider) listWikiSpace(ctx context.Context, accessToken, targetRef string) ([]provider.RemoteObject, error) {
+	target, err := p.resolveWikiListTarget(ctx, accessToken, targetRef)
+	if err != nil {
+		return nil, err
+	}
 	visited := make(map[string]struct{}, 128)
 	out := make([]provider.RemoteObject, 0, 512)
 	if p.log != nil {
 		p.log.Info("feishu wiki walk start",
-			zap.String("space_id", strings.TrimSpace(spaceID)),
+			zap.String("space_id", strings.TrimSpace(target.SpaceID)),
+			zap.String("target_ref", strings.TrimSpace(targetRef)),
 		)
 	}
-	if err := p.walkWikiNodes(ctx, accessToken, spaceID, "", "", "", visited, &out); err != nil {
+
+	if len(target.Root) > 0 {
+		rec, nodeToken, isDir := wikiNodeRemoteObject(target.Root, "", "", target.RootToken)
+		if nodeToken == "" {
+			return nil, fmt.Errorf("feishu wiki target_ref resolved without node_token")
+		}
+		visited[nodeToken] = struct{}{}
+		out = append(out, rec)
+		if isDir {
+			if err := p.walkWikiNodes(ctx, accessToken, target.SpaceID, nodeToken, rec.ExternalPath, nodeToken, visited, &out); err != nil {
+				return nil, err
+			}
+		}
+	} else if err := p.walkWikiNodes(ctx, accessToken, target.SpaceID, "", "", "", visited, &out); err != nil {
 		return nil, err
 	}
+
 	if p.log != nil {
 		p.log.Info("feishu wiki walk done",
-			zap.String("space_id", strings.TrimSpace(spaceID)),
+			zap.String("space_id", strings.TrimSpace(target.SpaceID)),
+			zap.String("target_ref", strings.TrimSpace(targetRef)),
 			zap.Int("objects_total", len(out)),
 		)
 	}
 	return out, nil
+}
+
+func (p *Provider) resolveWikiListTarget(ctx context.Context, accessToken, targetRef string) (wikiListTarget, error) {
+	ref := normalizeFeishuTargetRef(targetRef)
+	if ref == "" {
+		return wikiListTarget{}, fmt.Errorf("feishu wiki target_ref(space_id or wiki token) is required")
+	}
+	if isDigitsOnly(ref) {
+		return wikiListTarget{SpaceID: ref}, nil
+	}
+
+	var data map[string]any
+	if err := p.getJSON(ctx, accessToken, "/wiki/v2/spaces/get_node", map[string]string{"token": ref}, &data); err != nil {
+		return wikiListTarget{}, fmt.Errorf("resolve feishu wiki target_ref via get_node failed: %w", err)
+	}
+	node := mapValue(data["node"])
+	if len(node) == 0 {
+		node = data
+	}
+	spaceID := strings.TrimSpace(firstNonEmptyString(valueAsString(node["space_id"]), valueAsString(data["space_id"])))
+	if spaceID == "" {
+		return wikiListTarget{}, fmt.Errorf("resolve feishu wiki target_ref via get_node failed: response missing space_id")
+	}
+	if p.log != nil {
+		p.log.Info("feishu wiki token resolved",
+			zap.String("target_ref", ref),
+			zap.String("space_id", spaceID),
+			zap.String("node_token", firstNonEmptyString(valueAsString(node["node_token"]), valueAsString(node["token"]), ref)),
+		)
+	}
+	rootToken := firstNonEmptyString(valueAsString(node["node_token"]), valueAsString(node["token"]), ref)
+	return wikiListTarget{SpaceID: spaceID, Root: node, RootToken: rootToken}, nil
 }
 
 func (p *Provider) walkWikiNodes(
@@ -330,7 +453,7 @@ func (p *Provider) walkWikiNodes(
 			)
 		}
 		for _, node := range nodes {
-			nodeToken := strings.TrimSpace(firstNonEmptyString(valueAsString(node["node_token"]), valueAsString(node["token"])))
+			rec, nodeToken, isDir := wikiNodeRemoteObject(node, parentPath, parentID, "")
 			if nodeToken == "" {
 				continue
 			}
@@ -339,56 +462,9 @@ func (p *Provider) walkWikiNodes(
 			}
 			visited[nodeToken] = struct{}{}
 
-			title := strings.TrimSpace(firstNonEmptyString(valueAsString(node["title"]), valueAsString(node["obj_name"]), nodeToken))
-			objType := strings.ToLower(strings.TrimSpace(valueAsString(node["obj_type"])))
-			objToken := strings.TrimSpace(valueAsString(node["obj_token"]))
-			hasChild := valueAsBool(node["has_child"])
-			isDir := hasChild || objType == "folder" || objType == "wiki" || objType == "space"
-			currentPath := joinPath(parentPath, title)
-
-			mod := parseFeishuTime(valueAsString(node["update_time"]))
-			if mod == nil {
-				mod = parseFeishuTime(valueAsString(node["edit_time"]))
-			}
-			if mod == nil {
-				mod = parseFeishuTime(valueAsString(node["modified_time"]))
-			}
-			version := firstNonEmptyString(
-				valueAsString(node["update_time"]),
-				valueAsString(node["edit_time"]),
-				valueAsString(node["modified_time"]),
-			)
-			downloadRef := objToken
-			if downloadRef == "" {
-				downloadRef = nodeToken
-			}
-			kind := objType
-			if kind == "" {
-				if isDir {
-					kind = "folder"
-				} else {
-					kind = "file"
-				}
-			}
-			rec := provider.RemoteObject{
-				ExternalObjectID:   nodeToken,
-				ExternalParentID:   strings.TrimSpace(parentID),
-				ExternalPath:       currentPath,
-				ExternalName:       title,
-				ExternalKind:       kind,
-				ExternalVersion:    version,
-				ExternalModifiedAt: mod,
-				SizeBytes:          valueAsInt64(node["size"]),
-				DownloadRef:        downloadRef,
-				ProviderMeta: map[string]any{
-					"obj_type":   objType,
-					"obj_token":  objToken,
-					"node_token": nodeToken,
-				},
-			}
 			*out = append(*out, rec)
 			if isDir {
-				if err := p.walkWikiNodes(ctx, accessToken, spaceID, nodeToken, currentPath, nodeToken, visited, out); err != nil {
+				if err := p.walkWikiNodes(ctx, accessToken, spaceID, nodeToken, rec.ExternalPath, nodeToken, visited, out); err != nil {
 					return err
 				}
 			}
@@ -396,6 +472,75 @@ func (p *Provider) walkWikiNodes(
 		pageToken = strings.TrimSpace(firstNonEmptyString(data.PageToken, data.NextPageToken))
 		if pageToken == "" {
 			break
+		}
+	}
+	return nil
+}
+
+func wikiNodeRemoteObject(node map[string]any, parentPath, parentID, fallbackToken string) (provider.RemoteObject, string, bool) {
+	nodeToken := strings.TrimSpace(firstNonEmptyString(valueAsString(node["node_token"]), valueAsString(node["token"]), fallbackToken))
+	if nodeToken == "" {
+		return provider.RemoteObject{}, "", false
+	}
+	title := strings.TrimSpace(firstNonEmptyString(valueAsString(node["title"]), valueAsString(node["obj_name"]), nodeToken))
+	objType := strings.ToLower(strings.TrimSpace(valueAsString(node["obj_type"])))
+	objToken := strings.TrimSpace(valueAsString(node["obj_token"]))
+	hasChild := valueAsBool(node["has_child"])
+	isDir := hasChild || objType == "folder" || objType == "wiki" || objType == "space"
+	currentPath := joinPath(parentPath, title)
+
+	mod := parseFirstFeishuTime(
+		valueAsString(node["obj_edit_time"]),
+		valueAsString(node["update_time"]),
+		valueAsString(node["edit_time"]),
+		valueAsString(node["modified_time"]),
+		valueAsString(node["node_update_time"]),
+		valueAsString(node["obj_update_time"]),
+	)
+	version := firstNonEmptyString(
+		valueAsString(node["obj_edit_time"]),
+		valueAsString(node["update_time"]),
+		valueAsString(node["edit_time"]),
+		valueAsString(node["modified_time"]),
+		valueAsString(node["node_update_time"]),
+		valueAsString(node["obj_update_time"]),
+	)
+	downloadRef := objToken
+	if downloadRef == "" {
+		downloadRef = nodeToken
+	}
+	kind := objType
+	if kind == "" {
+		if isDir {
+			kind = "folder"
+		} else {
+			kind = "file"
+		}
+	}
+	return provider.RemoteObject{
+		ExternalObjectID:   nodeToken,
+		ExternalParentID:   strings.TrimSpace(parentID),
+		ExternalPath:       currentPath,
+		ExternalName:       title,
+		ExternalKind:       kind,
+		ExternalVersion:    version,
+		ExternalModifiedAt: mod,
+		SizeBytes:          valueAsInt64(node["size"]),
+		DownloadRef:        downloadRef,
+		ProviderMeta: map[string]any{
+			"obj_type":   objType,
+			"obj_token":  objToken,
+			"node_token": nodeToken,
+			"space_id":   valueAsString(node["space_id"]),
+			"has_child":  hasChild,
+		},
+	}, nodeToken, isDir
+}
+
+func parseFirstFeishuTime(values ...string) *time.Time {
+	for _, value := range values {
+		if parsed := parseFeishuTime(value); parsed != nil {
+			return parsed
 		}
 	}
 	return nil
@@ -540,6 +685,76 @@ func joinPath(parent, name string) string {
 	}
 }
 
+func normalizeFeishuTargetRef(raw string) string {
+	raw = strings.Trim(strings.TrimSpace(raw), "<>")
+	if raw == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(raw); err == nil {
+		for _, key := range []string{"space_id", "wiki_space_id", "node_token", "wiki_token", "token"} {
+			if value := strings.TrimSpace(parsed.Query().Get(key)); value != "" {
+				return strings.Trim(value, "/")
+			}
+		}
+		if strings.TrimSpace(parsed.Host) != "" {
+			parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+			cleanParts := make([]string, 0, len(parts))
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				if decoded, err := url.PathUnescape(part); err == nil {
+					part = decoded
+				}
+				cleanParts = append(cleanParts, strings.TrimSpace(part))
+			}
+			for idx, part := range cleanParts {
+				key := strings.ToLower(strings.TrimSpace(part))
+				if key == "wiki" && idx+1 < len(cleanParts) {
+					if knownFeishuURLPathSegment(cleanParts[idx+1]) {
+						continue
+					}
+					return strings.Trim(cleanParts[idx+1], "/")
+				}
+				if (key == "space" || key == "spaces") && idx+1 < len(cleanParts) {
+					return strings.Trim(cleanParts[idx+1], "/")
+				}
+			}
+			for idx := len(cleanParts) - 1; idx >= 0; idx-- {
+				part := strings.Trim(cleanParts[idx], "/")
+				if part == "" || knownFeishuURLPathSegment(part) {
+					continue
+				}
+				return part
+			}
+		}
+	}
+	return strings.Trim(raw, "/")
+}
+
+func knownFeishuURLPathSegment(part string) bool {
+	switch strings.ToLower(strings.TrimSpace(part)) {
+	case "wiki", "space", "spaces", "pages", "page", "folder", "folders", "setting", "settings":
+		return true
+	default:
+		return false
+	}
+}
+
+func isDigitsOnly(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func parseFeishuTime(raw string) *time.Time {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -627,6 +842,13 @@ func firstNonEmptyString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func mapValue(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
 }
 
 func stringOption(options map[string]any, key string) string {

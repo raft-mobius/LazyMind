@@ -11,7 +11,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/lazyrag/file_watcher/internal/config"
+	"github.com/lazymind/file_watcher/internal/config"
 )
 
 func TestStageFileRejectsTraversalIDs(t *testing.T) {
@@ -31,6 +31,26 @@ func TestStageFileRejectsTraversalIDs(t *testing.T) {
 
 	if _, err := svc.StageFile(context.Background(), "../source", "doc", "v1", srcPath); err == nil {
 		t.Fatal("expected traversal-like source_id to be rejected")
+	}
+}
+
+func TestStageFileRejectsTransientEditorFiles(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	srcPath := filepath.Join(root, ".source.txt.swp")
+	if err := os.WriteFile(srcPath, []byte("tmp"), 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+
+	svc := NewStagingService(config.StagingConfig{
+		Enabled:       true,
+		HostRoot:      filepath.Join(root, "host"),
+		ContainerRoot: "/data/staging",
+	}, zap.NewNop())
+
+	if _, err := svc.StageFile(context.Background(), "src-1", "doc", "v1", srcPath); err == nil {
+		t.Fatal("expected transient editor file to be rejected")
 	}
 }
 

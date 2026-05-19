@@ -13,10 +13,10 @@ import (
 
 	"gorm.io/gorm"
 
-	"lazyrag/core/common"
-	"lazyrag/core/common/orm"
-	appLog "lazyrag/core/log"
-	"lazyrag/core/store"
+	"lazymind/core/common"
+	"lazymind/core/common/orm"
+	appLog "lazymind/core/log"
+	"lazymind/core/store"
 )
 
 var errInvalidSuggestionFilter = errors.New("invalid suggestion filter")
@@ -395,16 +395,7 @@ func applySuggestionSkillFilter(ctx context.Context, db *gorm.DB, query *gorm.DB
 	}
 
 	resourceKey := SkillSuggestionResourceKey(skill)
-	parentName := firstNonEmptyFilterValue(strings.TrimSpace(skill.ParentSkillName), strings.TrimSpace(skill.SkillName))
-	return query.Where(
-		"resource_type = ? AND (resource_key = ? OR relative_path = ? OR (category = ? AND (parent_skill_name = ? OR (TRIM(COALESCE(parent_skill_name, '')) = '' AND skill_name = ?))))",
-		ResourceTypeSkill,
-		resourceKey,
-		resourceKey,
-		strings.TrimSpace(skill.Category),
-		parentName,
-		parentName,
-	), nil
+	return query.Where("resource_type = ? AND resource_key = ?", ResourceTypeSkill, resourceKey), nil
 }
 
 func applySuggestionMemoryFilter(ctx context.Context, db *gorm.DB, query *gorm.DB, memoryID string) (*gorm.DB, error) {
@@ -455,15 +446,6 @@ func applySuggestionPreferenceFilter(ctx context.Context, db *gorm.DB, query *go
 		query = query.Where("user_id = ?", strings.TrimSpace(row.UserID))
 	}
 	return query, nil
-}
-
-func firstNonEmptyFilterValue(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
 }
 
 func parsePositiveInt(raw string, fallback int) int {

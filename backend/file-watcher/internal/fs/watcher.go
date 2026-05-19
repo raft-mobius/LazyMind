@@ -10,8 +10,8 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 
-	internal "github.com/lazyrag/file_watcher/internal"
-	"github.com/lazyrag/file_watcher/internal/config"
+	internal "github.com/lazymind/file_watcher/internal"
+	"github.com/lazymind/file_watcher/internal/config"
 )
 
 // RecursiveWatcher defines the recursive file watching interface.
@@ -315,6 +315,13 @@ func (rw *recursiveWatcher) handleFsEvent(
 	schedule func(string, internal.FileEventType, bool),
 ) {
 	isDir := isDirectory(ev.Name)
+	if isTransientFile(ev.Name, isDir) {
+		rw.log.Debug("ignored transient file event",
+			zap.String("path", ev.Name),
+			zap.String("op", ev.Op.String()),
+		)
+		return
+	}
 
 	switch {
 	case ev.Op&fsnotify.Create != 0:

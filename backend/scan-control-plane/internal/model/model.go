@@ -45,27 +45,31 @@ const (
 )
 
 type Source struct {
-	ID                    string       `json:"id"`
-	TenantID              string       `json:"tenant_id"`
-	Name                  string       `json:"name"`
-	SourceType            string       `json:"source_type"`
-	RootPath              string       `json:"root_path"`
-	Status                SourceStatus `json:"status"`
-	WatchEnabled          bool         `json:"watch_enabled"`
-	IdleWindowSeconds     int64        `json:"idle_window_seconds"`
-	ReconcileSeconds      int64        `json:"reconcile_seconds"`
-	ReconcileSchedule     string       `json:"reconcile_schedule,omitempty"`
-	AgentID               string       `json:"agent_id"`
-	DatasetID             string       `json:"dataset_id,omitempty"`
-	DefaultOriginType     string       `json:"default_origin_type"`
-	DefaultOriginPlatform string       `json:"default_origin_platform"`
-	DefaultTriggerPolicy  string       `json:"default_trigger_policy"`
-	CreatedAt             time.Time    `json:"created_at"`
-	UpdatedAt             time.Time    `json:"updated_at"`
+	ID                    string                   `json:"id"`
+	TenantID              string                   `json:"tenant_id"`
+	CreateUserID          string                   `json:"create_user_id,omitempty"`
+	Name                  string                   `json:"name"`
+	SourceType            string                   `json:"source_type"`
+	RootPath              string                   `json:"root_path"`
+	Status                SourceStatus             `json:"status"`
+	WatchEnabled          bool                     `json:"watch_enabled"`
+	IdleWindowSeconds     int64                    `json:"idle_window_seconds"`
+	ReconcileSeconds      int64                    `json:"reconcile_seconds"`
+	ReconcileSchedule     string                   `json:"reconcile_schedule,omitempty"`
+	AgentID               string                   `json:"agent_id"`
+	DatasetID             string                   `json:"dataset_id,omitempty"`
+	DefaultOriginType     string                   `json:"default_origin_type"`
+	DefaultOriginPlatform string                   `json:"default_origin_platform"`
+	DefaultTriggerPolicy  string                   `json:"default_trigger_policy"`
+	CreatedAt             time.Time                `json:"created_at"`
+	UpdatedAt             time.Time                `json:"updated_at"`
+	CloudBinding          *CloudSourceBinding      `json:"cloud_binding,omitempty"`
+	Documents             *SourceDocumentsResponse `json:"documents,omitempty"`
 }
 
 type CreateSourceRequest struct {
 	TenantID              string `json:"tenant_id"`
+	CreateUserID          string `json:"create_user_id,omitempty"`
 	Name                  string `json:"name"`
 	RootPath              string `json:"root_path"`
 	AgentID               string `json:"agent_id"`
@@ -110,6 +114,18 @@ type UpsertCloudSourceBindingRequest struct {
 	ExcludePatterns       []string       `json:"exclude_patterns,omitempty"`
 	MaxObjectSizeBytes    int64          `json:"max_object_size_bytes,omitempty"`
 	ProviderOptions       map[string]any `json:"provider_options,omitempty"`
+}
+
+type ValidateCloudTargetRequest struct {
+	Provider         string         `json:"provider"`
+	AuthConnectionID string         `json:"auth_connection_id"`
+	TargetType       string         `json:"target_type,omitempty"`
+	TargetRef        string         `json:"target_ref,omitempty"`
+	ProviderOptions  map[string]any `json:"provider_options,omitempty"`
+}
+
+type ValidateCloudTargetResponse struct {
+	Valid bool `json:"valid"`
 }
 
 type CloudSourceBinding struct {
@@ -346,6 +362,8 @@ type ParseTaskListItem struct {
 	TenantID                string     `json:"tenant_id"`
 	SourceID                string     `json:"source_id"`
 	SourceName              string     `json:"source_name"`
+	SourceCreateUserID      string     `json:"-"`
+	SourceCreateUserName    string     `json:"-"`
 	DocumentID              int64      `json:"document_id"`
 	SourceObjectID          string     `json:"source_object_id"`
 	TaskAction              string     `json:"task_action,omitempty"`
@@ -423,6 +441,8 @@ type SourceDocumentsSummary struct {
 
 type SourceDocumentItem struct {
 	DocumentID              int64      `json:"document_id"`
+	SourceCreateUserID      string     `json:"-"`
+	SourceCreateUserName    string     `json:"-"`
 	Name                    string     `json:"name"`
 	Path                    string     `json:"path"`
 	Directory               string     `json:"directory"`
@@ -433,6 +453,7 @@ type SourceDocumentItem struct {
 	ParseState              string     `json:"parse_state"`
 	FileType                string     `json:"file_type,omitempty"`
 	SizeBytes               int64      `json:"size_bytes"`
+	SourceUpdatedAt         *time.Time `json:"source_updated_at,omitempty"`
 	LastSyncedAt            *time.Time `json:"last_synced_at,omitempty"`
 	CoreDatasetID           string     `json:"core_dataset_id,omitempty"`
 	CoreTaskID              string     `json:"core_task_id,omitempty"`
@@ -443,6 +464,15 @@ type SourceDocumentItem struct {
 	ParseTaskID             int64      `json:"-"`
 	ParseTaskAction         string     `json:"-"`
 	ParseTaskTargetVersion  string     `json:"-"`
+	ObjectKey               string     `json:"object_key,omitempty"`
+	SourceState             string     `json:"source_state,omitempty"`
+	SyncState               string     `json:"sync_state,omitempty"`
+	PendingAction           string     `json:"pending_action,omitempty"`
+	SourceVersion           string     `json:"source_version,omitempty"`
+	BaselineVersion         string     `json:"baseline_version,omitempty"`
+	NextSyncAt              *time.Time `json:"next_sync_at,omitempty"`
+	KnowledgeBasePresent    *bool      `json:"knowledge_base_present,omitempty"`
+	LastError               string     `json:"last_error,omitempty"`
 }
 
 type SourceDocumentsResponse struct {
@@ -485,6 +515,7 @@ type AgentPathTreeRequest struct {
 	AgentID      string `json:"agent_id"`
 	SourceID     string `json:"source_id,omitempty"`
 	Path         string `json:"path"`
+	Keyword      string `json:"keyword,omitempty"`
 	MaxDepth     int    `json:"max_depth,omitempty"`
 	IncludeFiles bool   `json:"include_files,omitempty"`
 	ChangesOnly  bool   `json:"changes_only,omitempty"`
@@ -493,6 +524,7 @@ type AgentPathTreeRequest struct {
 
 type SourcePathTreeRequest struct {
 	Path         string `json:"path,omitempty"`
+	Keyword      string `json:"keyword,omitempty"`
 	MaxDepth     int    `json:"max_depth,omitempty"`
 	IncludeFiles bool   `json:"include_files,omitempty"`
 	ChangesOnly  bool   `json:"changes_only,omitempty"`
@@ -509,18 +541,25 @@ type AgentPathValidateResponse struct {
 }
 
 type TreeNode struct {
-	Title           string     `json:"title"`
-	Key             string     `json:"key"`
-	IsDir           bool       `json:"is_dir"`
-	HasUpdate       *bool      `json:"has_update,omitempty"`
-	UpdateType      string     `json:"update_type,omitempty"`
-	UpdateDesc      string     `json:"update_desc,omitempty"`
-	Selectable      *bool      `json:"selectable,omitempty"`
-	ExternalFileID  string     `json:"external_file_id,omitempty"`
-	ParseQueueState string     `json:"parse_queue_state,omitempty"`
-	CoreTaskState   string     `json:"core_task_state,omitempty"`
-	StatusSource    string     `json:"status_source,omitempty"`
-	Children        []TreeNode `json:"children,omitempty"`
+	Title                string     `json:"title"`
+	Key                  string     `json:"key"`
+	IsDir                bool       `json:"is_dir"`
+	HasUpdate            *bool      `json:"has_update,omitempty"`
+	UpdateType           string     `json:"update_type,omitempty"`
+	UpdateDesc           string     `json:"update_desc,omitempty"`
+	Selectable           *bool      `json:"selectable,omitempty"`
+	ExternalFileID       string     `json:"external_file_id,omitempty"`
+	ParseQueueState      string     `json:"parse_queue_state,omitempty"`
+	CoreTaskState        string     `json:"core_task_state,omitempty"`
+	StatusSource         string     `json:"status_source,omitempty"`
+	ObjectKey            string     `json:"object_key,omitempty"`
+	SourceState          string     `json:"source_state,omitempty"`
+	SyncState            string     `json:"sync_state,omitempty"`
+	PendingAction        string     `json:"pending_action,omitempty"`
+	NextSyncAt           *time.Time `json:"next_sync_at,omitempty"`
+	LastError            string     `json:"last_error,omitempty"`
+	KnowledgeBasePresent *bool      `json:"knowledge_base_present,omitempty"`
+	Children             []TreeNode `json:"children,omitempty"`
 }
 
 type AgentPathTreeResponse struct {

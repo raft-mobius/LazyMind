@@ -36,20 +36,22 @@ type DatasetFilters struct {
 }
 
 type LazyChatRequest struct {
-	Query           string          `json:"query"`
-	History         []ChatMessage   `json:"history,omitempty"`
-	SessionID       string          `json:"session_id"`
-	Files           []string        `json:"files,omitempty"`
-	Filters         *DatasetFilters `json:"filters"`
-	Reasoning       bool            `json:"reasoning"`
-	Databases       []any           `json:"databases,omitempty"`
-	EnableThinking  bool            `json:"enable_thinking,omitempty"`
-	AvailableTools  []string        `json:"available_tools,omitempty"`
-	AvailableSkills []string        `json:"available_skills,omitempty"`
-	Memory          string          `json:"memory,omitempty"`
-	UserPreference  string          `json:"user_preference,omitempty"`
-	UseMemory       bool            `json:"use_memory"`
-	UserID          string          `json:"user_id"`
+	Query              string          `json:"query"`
+	History            []ChatMessage   `json:"history,omitempty"`
+	SessionID          string          `json:"session_id"`
+	Files              []string        `json:"files,omitempty"`
+	Filters            *DatasetFilters `json:"filters"`
+	Reasoning          bool            `json:"reasoning"`
+	Databases          []any           `json:"databases,omitempty"`
+	EnableThinking     bool            `json:"enable_thinking,omitempty"`
+	AvailableTools     []string        `json:"available_tools,omitempty"`
+	AvailableSkills    []string        `json:"available_skills,omitempty"`
+	Memory             string          `json:"memory,omitempty"`
+	UserPreference     string          `json:"user_preference,omitempty"`
+	UseMemory          bool            `json:"use_memory"`
+	UserID             string          `json:"user_id"`
+	EnvironmentContext map[string]any  `json:"environment_context,omitempty"`
+	LLMConfig          map[string]any  `json:"llm_config,omitempty"`
 }
 
 // LazyChatData text data text。
@@ -120,7 +122,10 @@ func (c *ChatService) Chat(ctx context.Context, req *LazyChatRequest) (*LazyChat
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("DEBUG upstream request url=%s body=%s\n", c.chatURL, string(bodyBytes))
+	fmt.Printf(
+		"[Core] [CHAT_UPSTREAM_REQUEST] [stream=false] [url=%s] [session_id=%s] [user_id=%s] [reasoning=%v] [%s]\n",
+		c.chatURL, req.SessionID, req.UserID, req.Reasoning, summarizeLLMConfigForLog(req.LLMConfig),
+	)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
@@ -148,7 +153,10 @@ func (c *ChatService) StreamChat(ctx context.Context, req *LazyChatRequest) (<-c
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("DEBUG upstream request url=%s body=%s\n", c.streamChatURL, string(bodyBytes))
+	fmt.Printf(
+		"[Core] [CHAT_UPSTREAM_REQUEST] [stream=true] [url=%s] [session_id=%s] [user_id=%s] [reasoning=%v] [%s]\n",
+		c.streamChatURL, req.SessionID, req.UserID, req.Reasoning, summarizeLLMConfigForLog(req.LLMConfig),
+	)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.streamChatURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
@@ -157,10 +165,10 @@ func (c *ChatService) StreamChat(ctx context.Context, req *LazyChatRequest) (<-c
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		fmt.Println("DEBUG upstream request failed url=", c.streamChatURL, " err=", err)
+		fmt.Println("[Core] [CHAT_UPSTREAM_FAILED] url=", c.streamChatURL, " err=", err)
 		return nil, err
 	}
-	fmt.Println("DEBUG upstream response url=", c.streamChatURL, " status=", resp.StatusCode)
+	fmt.Println("[Core] [CHAT_UPSTREAM_RESPONSE] url=", c.streamChatURL, " status=", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		return nil, errors.New("upstream /api/chat_stream returned non-200")
@@ -249,8 +257,14 @@ func buildLazyChatRequest(body map[string]any) *LazyChatRequest {
 	if useMemory, ok := body["use_memory"].(bool); ok {
 		req.UseMemory = useMemory
 	}
+	if environmentContext, ok := body["environment_context"].(map[string]any); ok {
+		req.EnvironmentContext = environmentContext
+	}
 	if userID, ok := body["user_id"].(string); ok {
 		req.UserID = strings.TrimSpace(userID)
+	}
+	if llmConfig, ok := body["llm_config"].(map[string]any); ok {
+		req.LLMConfig = llmConfig
 	}
 	return req
 }

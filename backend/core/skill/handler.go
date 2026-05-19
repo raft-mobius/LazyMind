@@ -6,20 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"gorm.io/gorm"
 
-	"lazyrag/core/common"
-	"lazyrag/core/common/orm"
-	"lazyrag/core/evolution"
-	appLog "lazyrag/core/log"
-	"lazyrag/core/store"
+	"lazymind/core/common"
+	"lazymind/core/common/orm"
+	"lazymind/core/evolution"
+	appLog "lazymind/core/log"
+	"lazymind/core/store"
 )
 
 type suggestionRequest struct {
 	SessionID   string                        `json:"session_id"`
+	ID          string                        `json:"id"`
+	SkillID     string                        `json:"skill_id"`
 	Category    string                        `json:"category"`
 	SkillName   string                        `json:"skill_name"`
 	Suggestions []evolution.SuggestionPayload `json:"suggestions"`
@@ -33,11 +36,17 @@ type createRequest struct {
 }
 
 type removeRequest struct {
+	ID        string `json:"id"`
 	SessionID string `json:"session_id"`
 	Category  string `json:"category"`
 	SkillName string `json:"skill_name"`
 	Reason    string `json:"reason"`
 }
+
+var (
+	errSuggestionSkillNotFound    = errors.New("skill not found")
+	errSuggestionSnapshotNotFound = errors.New("session snapshot not found")
+)
 
 func payloadForLog(v any) string {
 	b, err := json.Marshal(v)
@@ -60,23 +69,28 @@ func Suggestion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.SessionID = strings.TrimSpace(req.SessionID)
+	req.ID = strings.TrimSpace(req.ID)
+	req.SkillID = strings.TrimSpace(req.SkillID)
 	req.Category = strings.TrimSpace(req.Category)
 	req.SkillName = strings.TrimSpace(req.SkillName)
+	skillID := firstNonEmpty(req.SkillID, req.ID)
 	appLog.Logger.Info().
 		Str("route", "/skill/suggestion").
 		Str("session_id", req.SessionID).
+		Str("skill_id", skillID).
 		Str("category", req.Category).
 		Str("skill_name", req.SkillName).
 		Int("suggestion_count", len(req.Suggestions)).
 		Msg("internal skill mutation request received")
-	if req.SessionID == "" || req.Category == "" || req.SkillName == "" {
+	if req.SessionID == "" || (skillID == "" && (req.Category == "" || req.SkillName == "")) {
 		appLog.Logger.Warn().
 			Str("route", "/skill/suggestion").
 			Str("session_id", req.SessionID).
+			Str("skill_id", skillID).
 			Str("category", req.Category).
 			Str("skill_name", req.SkillName).
 			Msg("internal skill suggestion request rejected: missing required fields")
-		common.ReplyErr(w, "session_id/category/skill_name required", http.StatusBadRequest)
+		common.ReplyErr(w, "session_id and id or category/skill_name required", http.StatusBadRequest)
 		return
 	}
 	if len(req.Suggestions) == 0 || len(req.Suggestions) > 5 {
@@ -106,20 +120,20 @@ func Suggestion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := evolution.LoadParentSkillState(r.Context(), db, userID, req.Category, req.SkillName)
+	state, snapshot, err := resolveSuggestionSkillSnapshot(r.Context(), db, req, userID, skillID)
 	if err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, errSuggestionSkillNotFound) {
 			common.ReplyErr(w, "skill not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, errSuggestionSnapshotNotFound) {
+			common.ReplyErr(w, "session snapshot not found", http.StatusNotFound)
 			return
 		}
 		common.ReplyErr(w, "query skill failed", http.StatusInternalServerError)
 		return
 	}
-	snapshot, err := evolution.FindSnapshot(r.Context(), db, req.SessionID, evolution.ResourceTypeSkill, state.RelativePath)
-	if err != nil {
-		common.ReplyErr(w, "session snapshot not found", http.StatusNotFound)
-		return
-	}
+	resourceKey := evolution.SkillSuggestionResourceKey(*state.Resource)
 
 	status := evolution.SuggestionStatusPendingReview
 	invalidReason := ""
@@ -131,8 +145,8 @@ func Suggestion(w http.ResponseWriter, r *http.Request) {
 	rows := make([]orm.ResourceSuggestion, 0, len(req.Suggestions))
 	result := make([]evolution.RecordedSuggestion, 0, len(req.Suggestions))
 	for _, item := range req.Suggestions {
-		row := evolution.BuildSuggestionRecord(userID, evolution.ResourceTypeSkill, state.RelativePath, evolution.SuggestionActionModify, req.SessionID, status)
-		row.Category = req.Category
+		row := evolution.BuildSuggestionRecord(userID, evolution.ResourceTypeSkill, resourceKey, evolution.SuggestionActionModify, req.SessionID, status)
+		row.Category = strings.TrimSpace(state.Resource.Category)
 		row.ParentSkillName = strings.TrimSpace(state.Resource.ParentSkillName)
 		if row.ParentSkillName == "" {
 			row.ParentSkillName = strings.TrimSpace(state.Resource.SkillName)
@@ -186,6 +200,44 @@ func Suggestion(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	common.ReplyOK(w, map[string]any{"items": result})
+}
+
+func resolveSuggestionSkillSnapshot(ctx context.Context, db *gorm.DB, req suggestionRequest, userID, skillID string) (*evolution.SkillState, *orm.ResourceSessionSnapshot, error) {
+	var state *evolution.SkillState
+	var err error
+	if skillID != "" {
+		state, err = evolution.LoadSkillStateByResourceKey(ctx, db, userID, skillID)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, errSuggestionSkillNotFound
+		}
+	} else {
+		snapshot, snapshotErr := evolution.FindSkillSnapshotByIdentity(ctx, db, req.SessionID, userID, req.Category, req.SkillName)
+		if snapshotErr != nil {
+			if errors.Is(snapshotErr, gorm.ErrRecordNotFound) {
+				return nil, nil, errSuggestionSnapshotNotFound
+			}
+			return nil, nil, snapshotErr
+		}
+		state, err = evolution.LoadSkillStateByResourceKey(ctx, db, userID, snapshot.ResourceKey)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, nil, errSuggestionSkillNotFound
+			}
+			return nil, nil, err
+		}
+		return state, snapshot, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	snapshot, err := evolution.FindSnapshot(ctx, db, req.SessionID, evolution.ResourceTypeSkill, evolution.SkillSuggestionResourceKey(*state.Resource))
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, errSuggestionSnapshotNotFound
+		}
+		return nil, nil, err
+	}
+	return state, snapshot, nil
 }
 
 func Create(w http.ResponseWriter, r *http.Request) {
@@ -299,77 +351,81 @@ func Remove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.SessionID = strings.TrimSpace(req.SessionID)
+	req.ID = strings.TrimSpace(req.ID)
 	req.Category = strings.TrimSpace(req.Category)
 	req.SkillName = strings.TrimSpace(req.SkillName)
 	req.Reason = strings.TrimSpace(req.Reason)
-	appLog.Logger.Info().
-		Str("route", "/skill/remove").
-		Str("session_id", req.SessionID).
-		Str("category", req.Category).
-		Str("skill_name", req.SkillName).
-		Str("payload", payloadForLog(req)).
-		Msg("internal skill remove request received")
-	if req.SessionID == "" || req.Category == "" || req.SkillName == "" {
-		appLog.Logger.Warn().
-			Str("route", "/skill/remove").
-			Str("session_id", req.SessionID).
-			Str("category", req.Category).
-			Str("skill_name", req.SkillName).
-			Msg("internal skill remove request rejected: missing required fields")
-		common.ReplyErr(w, "session_id/category/skill_name required", http.StatusBadRequest)
-		return
-	}
-
-	userID, _, err := evolution.ResolveSessionUser(r.Context(), db, req.SessionID)
-	if err != nil || strings.TrimSpace(userID) == "" {
+	userID, err := resolveRemoveRequestUser(r.Context(), db, r, req)
+	if err != nil {
 		appLog.Logger.Warn().
 			Err(err).
 			Str("route", "/skill/remove").
 			Str("session_id", req.SessionID).
-			Msg("internal skill remove request rejected: unable to resolve session user")
-		common.ReplyErr(w, "unable to resolve session user", http.StatusBadRequest)
+			Str("skill_id", req.ID).
+			Msg("skill remove request rejected: unable to resolve user")
+		common.ReplyErr(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	appLog.Logger.Info().
+		Str("route", "/skill/remove").
+		Str("user_id", userID).
+		Str("skill_id", req.ID).
+		Str("payload", payloadForLog(req)).
+		Msg("skill remove request received")
 
-	state, err := evolution.LoadParentSkillState(r.Context(), db, userID, req.Category, req.SkillName)
+	skillRow, err := loadRemoveSkill(r.Context(), db, userID, req)
 	if err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, errRemoveTargetRequired) {
+			common.ReplyErr(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			common.ReplyErr(w, "skill not found", http.StatusNotFound)
 			return
 		}
+		appLog.Logger.Error().
+			Err(err).
+			Str("route", "/skill/remove").
+			Str("user_id", userID).
+			Str("skill_id", req.ID).
+			Str("category", req.Category).
+			Str("skill_name", req.SkillName).
+			Msg("internal skill remove request failed to query skill")
 		common.ReplyErr(w, "query skill failed", http.StatusInternalServerError)
 		return
 	}
-	snapshot, err := evolution.FindSnapshot(r.Context(), db, req.SessionID, evolution.ResourceTypeSkill, state.RelativePath)
-	if err != nil {
+	req.ID = firstNonEmpty(req.ID, strings.TrimSpace(skillRow.ID))
+	req.Category = firstNonEmpty(req.Category, strings.TrimSpace(skillRow.Category))
+	req.SkillName = firstNonEmpty(req.SkillName, strings.TrimSpace(skillRow.SkillName))
+
+	if req.ID == "" {
 		appLog.Logger.Warn().
-			Err(err).
 			Str("route", "/skill/remove").
-			Str("session_id", req.SessionID).
 			Str("user_id", userID).
 			Str("category", req.Category).
 			Str("skill_name", req.SkillName).
-			Msg("internal skill remove request rejected: session snapshot not found")
-		common.ReplyErr(w, "session snapshot not found", http.StatusNotFound)
+			Msg("skill remove request rejected: missing resolved id")
+		common.ReplyErr(w, "id required", http.StatusBadRequest)
 		return
 	}
 
 	status := evolution.SuggestionStatusPendingReview
 	invalidReason := ""
-	if state.ContentHash != snapshot.SnapshotHash {
-		status = evolution.SuggestionStatusInvalid
-		invalidReason = "snapshot hash mismatch"
+	resourceKey := evolution.SkillSuggestionResourceKey(skillRow)
+	snapshotHash := strings.TrimSpace(skillRow.ContentHash)
+	if snapshotHash == "" {
+		snapshotHash = evolution.HashContent(skillRow.Content)
 	}
 
 	now := time.Now()
 	title := fmt.Sprintf("删除技能: %s/%s", req.Category, req.SkillName)
-	parentSkillName := firstNonEmpty(strings.TrimSpace(state.Resource.ParentSkillName), strings.TrimSpace(state.Resource.SkillName))
+	parentSkillName := firstNonEmpty(strings.TrimSpace(skillRow.ParentSkillName), strings.TrimSpace(skillRow.SkillName))
 
 	var existingRow orm.ResourceSuggestion
 	upsertErr := db.WithContext(r.Context()).
 		Where("user_id = ? AND resource_type = ? AND action = ? AND resource_key = ? AND status = ?",
 			userID, evolution.ResourceTypeSkill, evolution.SuggestionActionRemove,
-			state.RelativePath, evolution.SuggestionStatusPendingReview).
+			resourceKey, evolution.SuggestionStatusPendingReview).
 		Take(&existingRow).Error
 
 	var row orm.ResourceSuggestion
@@ -378,7 +434,7 @@ func Remove(w http.ResponseWriter, r *http.Request) {
 		update := map[string]any{
 			"content":        req.Reason,
 			"reason":         req.Reason,
-			"snapshot_hash":  snapshot.SnapshotHash,
+			"snapshot_hash":  snapshotHash,
 			"status":         status,
 			"invalid_reason": invalidReason,
 			"title":          title,
@@ -397,7 +453,7 @@ func Remove(w http.ResponseWriter, r *http.Request) {
 		}
 		row.Content = req.Reason
 		row.Reason = req.Reason
-		row.SnapshotHash = snapshot.SnapshotHash
+		row.SnapshotHash = snapshotHash
 		row.Status = status
 		row.InvalidReason = invalidReason
 		row.Title = title
@@ -409,13 +465,13 @@ func Remove(w http.ResponseWriter, r *http.Request) {
 			Str("suggestion_id", row.ID).
 			Msg("internal skill remove request updated existing suggestion")
 	} else if errors.Is(upsertErr, gorm.ErrRecordNotFound) {
-		row = evolution.BuildSuggestionRecord(userID, evolution.ResourceTypeSkill, state.RelativePath, evolution.SuggestionActionRemove, req.SessionID, status)
+		row = evolution.BuildSuggestionRecord(userID, evolution.ResourceTypeSkill, resourceKey, evolution.SuggestionActionRemove, req.SessionID, status)
 		row.Category = req.Category
 		row.ParentSkillName = parentSkillName
-		row.SkillName = strings.TrimSpace(state.Resource.SkillName)
-		row.FileExt = firstNonEmpty(strings.TrimSpace(state.Resource.FileExt), "md")
-		row.RelativePath = state.RelativePath
-		row.SnapshotHash = snapshot.SnapshotHash
+		row.SkillName = strings.TrimSpace(skillRow.SkillName)
+		row.FileExt = firstNonEmpty(strings.TrimSpace(skillRow.FileExt), "md")
+		row.RelativePath = filepath.ToSlash(strings.TrimSpace(skillRow.RelativePath))
+		row.SnapshotHash = snapshotHash
 		row.Title = title
 		row.Content = req.Reason
 		row.Reason = req.Reason
@@ -442,7 +498,6 @@ func Remove(w http.ResponseWriter, r *http.Request) {
 		appLog.Logger.Error().
 			Err(upsertErr).
 			Str("route", "/skill/remove").
-			Str("session_id", req.SessionID).
 			Str("user_id", userID).
 			Msg("internal skill remove request failed to query existing suggestion")
 		common.ReplyErr(w, "query suggestion failed", http.StatusInternalServerError)
@@ -455,27 +510,62 @@ func Remove(w http.ResponseWriter, r *http.Request) {
 		InvalidReason: row.InvalidReason,
 	}
 
-	if state.Resource.AutoEvo && status != evolution.SuggestionStatusInvalid {
-		if err := disableSkillAutoEvoForPendingRemove(r.Context(), db, *state.Resource); err != nil {
+	if skillRow.AutoEvo && status != evolution.SuggestionStatusInvalid {
+		if err := disableSkillAutoEvoForPendingRemove(r.Context(), db, skillRow); err != nil {
 			appLog.Logger.Error().
 				Err(err).
 				Str("route", "/skill/remove").
 				Str("session_id", req.SessionID).
 				Str("user_id", userID).
-				Str("skill_id", state.Resource.ID).
+				Str("skill_id", skillRow.ID).
 				Msg("auto_evo disable failed for pending remove suggestion")
 		} else {
 			appLog.Logger.Info().
 				Str("route", "/skill/remove").
 				Str("session_id", req.SessionID).
 				Str("user_id", userID).
-				Str("skill_id", state.Resource.ID).
+				Str("skill_id", skillRow.ID).
 				Str("suggestion_id", row.ID).
 				Msg("auto_evo disabled for pending remove suggestion")
 		}
 	}
 
 	common.ReplyOK(w, map[string]any{"items": []evolution.RecordedSuggestion{result}})
+}
+
+var errRemoveTargetRequired = errors.New("id or category/skill_name required")
+
+func resolveRemoveRequestUser(ctx context.Context, db *gorm.DB, r *http.Request, req removeRequest) (string, error) {
+	if userID := strings.TrimSpace(store.UserID(r)); userID != "" {
+		return userID, nil
+	}
+	if req.SessionID == "" {
+		return "", errors.New("session_id required")
+	}
+	userID, _, err := evolution.ResolveSessionUser(ctx, db, req.SessionID)
+	if err != nil || strings.TrimSpace(userID) == "" {
+		if err != nil {
+			return "", fmt.Errorf("unable to resolve session user: %w", err)
+		}
+		return "", errors.New("unable to resolve session user")
+	}
+	return strings.TrimSpace(userID), nil
+}
+
+func loadRemoveSkill(ctx context.Context, db *gorm.DB, userID string, req removeRequest) (orm.SkillResource, error) {
+	if req.ID != "" {
+		var skillRow orm.SkillResource
+		err := db.WithContext(ctx).Where("owner_user_id = ? AND id = ?", userID, req.ID).Take(&skillRow).Error
+		return skillRow, err
+	}
+	if req.Category == "" || req.SkillName == "" {
+		return orm.SkillResource{}, errRemoveTargetRequired
+	}
+	state, err := evolution.LoadParentSkillState(ctx, db, userID, req.Category, req.SkillName)
+	if err != nil {
+		return orm.SkillResource{}, err
+	}
+	return *state.Resource, nil
 }
 
 func init() {
@@ -485,9 +575,9 @@ func init() {
 func applyRemoveSuggestion(ctx context.Context, db *gorm.DB, suggestion orm.ResourceSuggestion) error {
 	var skill orm.SkillResource
 	err := db.WithContext(ctx).
-		Where("owner_user_id = ? AND relative_path = ?",
+		Where("owner_user_id = ? AND id = ?",
 			strings.TrimSpace(suggestion.UserID),
-			strings.TrimSpace(suggestion.RelativePath),
+			strings.TrimSpace(suggestion.ResourceKey),
 		).
 		Take(&skill).Error
 	if err != nil {

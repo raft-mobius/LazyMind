@@ -6,10 +6,10 @@ import (
 	"sort"
 	"strings"
 
-	"lazyrag/core/chat"
-	"lazyrag/core/doc"
-	"lazyrag/core/modelprovider"
-	"lazyrag/core/wordgroup"
+	"lazymind/core/chat"
+	"lazymind/core/doc"
+	"lazymind/core/modelprovider"
+	"lazymind/core/wordgroup"
 )
 
 type schemaSource struct {
@@ -715,16 +715,19 @@ type suggestionBatchReviewOpenAPIResponse struct {
 }
 
 type skillChildCreateOpenAPIRequest struct {
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	FileExt string `json:"file_ext,omitempty"`
-	AutoEvo *bool  `json:"auto_evo,omitempty"`
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	Content     string   `json:"content"`
+	FileExt     string   `json:"file_ext,omitempty"`
+	AutoEvo     *bool    `json:"auto_evo,omitempty"`
 }
 
 type skillCreateManagedOpenAPIRequest struct {
 	Name            string                           `json:"name"`
 	Description     string                           `json:"description,omitempty"`
-	Category        string                           `json:"category"`
+	Category        string                           `json:"category,omitempty"`
+	ParentSkillID   string                           `json:"parent_skill_id,omitempty"`
 	ParentSkillName string                           `json:"parent_skill_name,omitempty"`
 	Tags            []string                         `json:"tags,omitempty"`
 	Content         string                           `json:"content"`
@@ -735,14 +738,16 @@ type skillCreateManagedOpenAPIRequest struct {
 }
 
 type skillUpdateManagedOpenAPIRequest struct {
-	Name        *string  `json:"name,omitempty"`
-	Description *string  `json:"description,omitempty"`
-	Category    *string  `json:"category,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
-	Content     *string  `json:"content,omitempty"`
-	FileExt     *string  `json:"file_ext,omitempty"`
-	AutoEvo     *bool    `json:"auto_evo,omitempty"`
-	IsEnabled   *bool    `json:"is_enabled,omitempty"`
+	Name            *string  `json:"name,omitempty"`
+	Description     *string  `json:"description,omitempty"`
+	Category        *string  `json:"category,omitempty"`
+	ParentSkillID   *string  `json:"parent_skill_id,omitempty"`
+	ParentSkillName *string  `json:"parent_skill_name,omitempty"`
+	Tags            []string `json:"tags,omitempty"`
+	Content         *string  `json:"content,omitempty"`
+	FileExt         *string  `json:"file_ext,omitempty"`
+	AutoEvo         *bool    `json:"auto_evo,omitempty"`
+	IsEnabled       *bool    `json:"is_enabled,omitempty"`
 }
 
 type skillListChildOpenAPIResponse struct {
@@ -759,6 +764,9 @@ type skillListChildOpenAPIResponse struct {
 	HasPendingReviewSuggestions bool   `json:"has_pending_review_suggestions"`
 	SuggestionStatus            string `json:"suggestion_status"`
 	NodeType                    string `json:"node_type"`
+	ParentID                    string `json:"parent_id"`
+	ParentSkillID               string `json:"parent_skill_id"`
+	ParentSkillName             string `json:"parent_skill_name"`
 }
 
 type skillListItemOpenAPIResponse struct {
@@ -800,6 +808,8 @@ type skillDetailChildOpenAPIResponse struct {
 	HasPendingReviewSuggestions bool   `json:"has_pending_review_suggestions"`
 	SuggestionStatus            string `json:"suggestion_status"`
 	NodeType                    string `json:"node_type"`
+	ParentID                    string `json:"parent_id"`
+	ParentSkillID               string `json:"parent_skill_id"`
 	ParentSkillName             string `json:"parent_skill_name"`
 	Content                     string `json:"content"`
 }
@@ -819,6 +829,8 @@ type skillDetailOpenAPIResponse struct {
 	HasPendingReviewSuggestions bool                              `json:"has_pending_review_suggestions"`
 	SuggestionStatus            string                            `json:"suggestion_status"`
 	NodeType                    string                            `json:"node_type"`
+	ParentID                    string                            `json:"parent_id"`
+	ParentSkillID               string                            `json:"parent_skill_id"`
 	ParentSkillName             string                            `json:"parent_skill_name"`
 	Content                     string                            `json:"content"`
 	FileExt                     string                            `json:"file_ext"`
@@ -995,8 +1007,10 @@ type systemDiscardOpenAPIResponse struct {
 
 type internalSkillSuggestionOpenAPIRequest struct {
 	SessionID   string                            `json:"session_id"`
-	Category    string                            `json:"category"`
-	SkillName   string                            `json:"skill_name"`
+	ID          string                            `json:"id,omitempty"`
+	SkillID     string                            `json:"skill_id,omitempty"`
+	Category    string                            `json:"category,omitempty"`
+	SkillName   string                            `json:"skill_name,omitempty"`
 	Suggestions []suggestionPayloadOpenAPIRequest `json:"suggestions"`
 }
 
@@ -1008,9 +1022,11 @@ type internalSkillCreateOpenAPIRequest struct {
 }
 
 type internalSkillRemoveOpenAPIRequest struct {
-	SessionID string `json:"session_id"`
-	Category  string `json:"category"`
-	SkillName string `json:"skill_name"`
+	ID        string `json:"id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	Category  string `json:"category,omitempty"`
+	SkillName string `json:"skill_name,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 func registeredCoreOperations() []openAPIOperation {
@@ -1496,10 +1512,10 @@ func registeredCoreOperations() []openAPIOperation {
 		{
 			Method:      "POST",
 			Path:        "/skill/remove",
-			Summary:     "Delete skill directly from internal request",
+			Summary:     "Delete skill by ID",
 			Tags:        []string{"skill-evolution"},
 			RequestBody: jsonBodyOf(internalSkillRemoveOpenAPIRequest{}, true),
-			Responses:   map[int]openAPIResponse{200: resp("Deleted skill", skillDeleteOpenAPIResponse{})},
+			Responses:   map[int]openAPIResponse{200: resp("Created remove suggestion", recordedSuggestionListOpenAPIResponse{})},
 		},
 		{
 			Method:      "POST",
@@ -1513,7 +1529,7 @@ func registeredCoreOperations() []openAPIOperation {
 			Method:      "GET",
 			Path:        "/model_providers",
 			Summary:     "List user model providers",
-			Description: "Per-user model provider list. On first request for a user, rows are copied from the built-in default_model_providers table. Requires X-User-Id; optional X-User-Name is stored on new rows. Query parameter keyword filters by provider name (SQL LIKE).",
+			Description: "Per-user model provider list. On first request for a user, rows are copied from the built-in default_model_providers table. The current user identity is injected by the auth gateway from the token. Query parameter keyword filters by provider name (SQL LIKE).",
 			Tags:        []string{"model_providers"},
 			QueryParams: listUserModelProvidersQueryParams{},
 			Responses:   map[int]openAPIResponse{200: resp("User model provider list", listUserModelProvidersOpenAPIResponse{})},
@@ -1522,7 +1538,7 @@ func registeredCoreOperations() []openAPIOperation {
 			Method:      "GET",
 			Path:        "/model_providers:with_groups",
 			Summary:     "List user model providers that have groups",
-			Description: "Returns user_model_providers for the current user that have at least one non-deleted row in user_model_provider_groups. Requires X-User-Id. Same response shape as GET /model_providers.",
+			Description: "Returns user_model_providers for the current user that have at least one non-deleted row in user_model_provider_groups. The current user identity is injected by the auth gateway from the token. Same response shape as GET /model_providers.",
 			Tags:        []string{"model_providers"},
 			Responses:   map[int]openAPIResponse{200: resp("User model providers with groups", listUserModelProvidersOpenAPIResponse{})},
 		},
@@ -1530,10 +1546,10 @@ func registeredCoreOperations() []openAPIOperation {
 			Method:      "POST",
 			Path:        "/model_providers/{model_provider_id}/groups/{group_id}:check",
 			Summary:     "Check model provider connectivity",
-			Description: "Validates credentials by proxying to the algorithm POST /api/model/check (LAZYRAG_ALGO_SERVICE_URL). Maps provider_name→source, base_url→url, api_key→api_key. Requires X-User-Id. Response data is the algorithm JSON payload.",
+			Description: "Validates credentials by proxying to the algorithm POST /api/model/check (LAZYMIND_ALGO_SERVICE_URL). Maps provider_name→source, base_url→url, api_key→api_key. The current user identity is injected by the auth gateway from the token. Response data is the algorithm JSON payload.",
 			Tags:        []string{"model_providers"},
 			RequestBody: jsonBodyOf(checkModelProviderOpenAPIRequest{}, true),
-			Responses:   map[int]openAPIResponse{200: resp("data contains only success (bool), mapped from algorithm /api/model/check", modelprovider.CheckModelProviderData{})},
+			Responses:   map[int]openAPIResponse{200: resp("data: success and message from algorithm /api/model/check", modelprovider.CheckModelProviderData{})},
 		},
 		{
 			Method:      "GET",
@@ -1594,7 +1610,7 @@ func registeredCoreOperations() []openAPIOperation {
 			Method:      "DELETE",
 			Path:        "/model_providers/{model_provider_id}/groups/{group_id}",
 			Summary:     "Delete model provider connection group",
-			Description: "Soft-deletes the group and its user_model_provider_group_models rows. Requires X-User-Id.",
+			Description: "Soft-deletes the group and its user_model_provider_group_models rows. The current user identity is injected by the auth gateway from the token.",
 			Tags:        []string{"model_providers"},
 			PathParams:  modelProviderGroupByIDPathParams{},
 			Responses:   map[int]openAPIResponse{200: resp("Deleted group", deleteModelProviderGroupOpenAPIResponse{})},
@@ -1622,7 +1638,7 @@ func registeredCoreOperations() []openAPIOperation {
 			Method:      "DELETE",
 			Path:        "/model_providers/{model_provider_id}/groups/{group_id}/models/{model_id}",
 			Summary:     "Delete model under a connection group",
-			Description: "Soft-deletes one user_model_provider_group_models row. Requires X-User-Id.",
+			Description: "Soft-deletes one user_model_provider_group_models row. The current user identity is injected by the auth gateway from the token.",
 			Tags:        []string{"model_providers"},
 			PathParams:  modelProviderGroupModelPathParams{},
 			Responses:   map[int]openAPIResponse{200: resp("Deleted group model", deleteModelProviderGroupModelOpenAPIResponse{})},
@@ -1843,18 +1859,18 @@ func registeredCoreOperations() []openAPIOperation {
 		{
 			Method:      "POST",
 			Path:        "/word_group:merge",
-			Summary:     "Merge word groups into the first group_id (first term kept; others become aliases)",
+			Summary:     "Merge word groups: soft-delete merged groups' words, recreate master group from term, aliases, description",
 			Tags:        []string{"word_group"},
 			RequestBody: jsonBodyOf(wordgroup.MergeWordGroupsRequest{}, true),
 			Responses:   map[int]openAPIResponse{200: resp("Merged word group", wordgroup.CreateWordGroupResponse{})},
 		},
 		{
 			Method:      "POST",
-			Path:        "/word_group:mergeAndAddWord",
-			Summary:     "Merge word groups then add one word into merged group as alias",
+			Path:        "/word_group_conflict:mergeAndAddWord",
+			Summary:     "Merge word groups from merges list, add word into group_ids, resolve conflict",
 			Tags:        []string{"word_group"},
 			RequestBody: jsonBodyOf(wordgroup.MergeAndAddWordRequest{}, true),
-			Responses:   map[int]openAPIResponse{200: resp("Merged word group with added word", wordgroup.CreateWordGroupResponse{})},
+			Responses:   map[int]openAPIResponse{200: resp("Merged word groups with added word (one item per merge batch)", wordgroup.MergeAndAddWordResponse{})},
 		},
 		{
 			Method:      "POST",
@@ -1882,6 +1898,17 @@ func registeredCoreOperations() []openAPIOperation {
 			RequestBody: jsonBodyOf(wordgroup.AddWordGroupConflictToGroupsRequest{}, true),
 			Responses: map[int]openAPIResponse{
 				200: resp("Conflict word add-to-group result", wordgroup.AddWordGroupConflictToGroupsResponse{}),
+			},
+		},
+		{
+			Method:      "POST",
+			Path:        "/word_group_conflict:createGroup",
+			Summary:     "Create word group from conflict and optionally add conflict word to existing groups",
+			Description: "Creates a new word group (term, aliases, description). If group_ids is non-empty, inserts the conflict word as alias into each existing group (skips duplicates). Soft-deletes the conflict row by id.",
+			Tags:        []string{"word_group"},
+			RequestBody: jsonBodyOf(wordgroup.CreateWordGroupFromConflictRequest{}, true),
+			Responses: map[int]openAPIResponse{
+				200: resp("Created word group from conflict", wordgroup.CreateWordGroupFromConflictResponse{}),
 			},
 		},
 		{

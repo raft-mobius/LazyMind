@@ -8,9 +8,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"lazyrag/core/common"
-	"lazyrag/core/common/orm"
-	"lazyrag/core/store"
+	"lazymind/core/common"
+	"lazymind/core/common/orm"
+	"lazymind/core/store"
 )
 
 type listItem struct {
@@ -54,7 +54,7 @@ func ListUserProviders(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var rows []orm.UserModelProvider
-	if err := q.Order("name ASC").Find(&rows).Error; err != nil {
+	if err := q.Order("name DESC").Find(&rows).Error; err != nil {
 		common.ReplyErr(w, "list model providers failed", http.StatusInternalServerError)
 		return
 	}

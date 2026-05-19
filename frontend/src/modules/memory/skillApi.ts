@@ -76,6 +76,9 @@ export interface SkillDraftPreviewRecord {
 }
 
 export interface ListSkillOptions {
+  keyword?: string;
+  category?: string;
+  tags?: string[];
   page?: number;
   pageSize?: number;
 }
@@ -864,11 +867,25 @@ export async function listSkillAssets(
 export async function listSkillAssetsPage(
   options: ListSkillOptions = {},
 ): Promise<SkillAssetListResult> {
+  const params = new URLSearchParams();
+  const keyword = options.keyword?.trim();
+  const category = options.category?.trim();
+  const tags = (options.tags ?? []).map((item) => item.trim()).filter(Boolean);
+
+  params.set("page", String(options.page ?? 1));
+  params.set("page_size", String(options.pageSize ?? 200));
+  if (keyword) {
+    params.set("keyword", keyword);
+  }
+  if (category) {
+    params.set("category", category);
+  }
+  tags.forEach((item) => {
+    params.append("tags", item);
+  });
+
   const response = await axiosInstance.get(`${coreBasePath}/skills`, {
-    params: {
-      page: options.page ?? 1,
-      page_size: options.pageSize ?? 200,
-    },
+    params,
   });
 
   const payload = unwrapEnvelope<unknown>(response.data);
@@ -895,18 +912,28 @@ export async function listSkillAssetsPage(
       options.pageSize ?? 200,
     ),
   );
-  const total = Math.max(
-    records.length,
-    toNumberValue(
-      rawPayload?.total ??
-        rawPayload?.total_count ??
-        rawPayload?.totalCount ??
-        rawEnvelope?.total ??
-        rawEnvelope?.total_count ??
-        rawEnvelope?.totalCount,
-      records.length,
-    ),
+  const paginationNode = getObjectCandidate([rawPayload, rawEnvelope], [
+    "pagination",
+    "pager",
+    "page_info",
+    "pageInfo",
+  ]);
+  const totalCandidate = getFirstValue(
+    [rawPayload, rawEnvelope, paginationNode],
+    [
+      "total",
+      "totle",
+      "total_count",
+      "totalCount",
+      "total_size",
+      "totalSize",
+      "count",
+    ],
   );
+  const total =
+    totalCandidate === undefined || totalCandidate === null
+      ? records.length
+      : Math.max(0, toNumberValue(totalCandidate, records.length));
 
   return {
     records,

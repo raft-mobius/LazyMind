@@ -2024,7 +2024,7 @@
   flex-wrap: wrap;
 }
 
-.self-evolution-px-panel.is-line {
+.self-evolution-px-panel.is-bar {
   flex-direction: column;
   align-items: stretch;
 }
@@ -2053,7 +2053,7 @@
   font-size: 12px;
 }
 
-.self-evolution-px-line-chart {
+.self-evolution-px-bar-chart {
   width: 100%;
   min-height: 280px;
 }
@@ -2068,9 +2068,12 @@
   stroke-width: 1.1;
 }
 
-.self-evolution-px-series-line {
-  stroke-linecap: round;
-  stroke-linejoin: round;
+.self-evolution-px-bar {
+  transition: opacity 0.18s ease;
+
+  &:hover {
+    opacity: 0.82;
+  }
 }
 
 .self-evolution-px-axis-label {
@@ -3365,9 +3368,9 @@
 
 .self-evolution-bubble.is-user {
   align-self: flex-end;
-  color: #f6fbff;
-  background: linear-gradient(135deg, #1f88e6 0%, #1563c2 100%);
-  border: 1px solid #165fb4;
+  color: #17426f;
+  background: linear-gradient(135deg, #dcecff 0%, #bdd8ff 100%);
+  border: 1px solid #93bff2;
 }
 
 .self-evolution-chat-composer {

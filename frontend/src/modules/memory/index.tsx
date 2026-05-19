@@ -25,7 +25,13 @@ import {
 } from "@ant-design/icons";
 import { getLocalizedErrorMessage } from "@/components/request";
 import { useTranslation } from "react-i18next";
-import { Outlet, useMatch, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  Outlet,
+  useLocation,
+  useMatch,
+  useNavigate,
+  useSearchParams,
+} from "react-router-dom";
 import {
   DEVELOPER_ACTIVE_EVENT,
   isDeveloperModeActive,
@@ -79,12 +85,13 @@ import {
   addGlossaryConflictToGroups,
   batchRemoveGlossaryAssets,
   checkGlossaryWordsExist,
+  createGlossaryGroupFromConflict,
   createGlossaryAsset,
   getGlossaryAssetDetail,
-  listGlossaryAssets,
   listGlossaryConflicts,
-  mergeGlossaryAssetsAndAddConflictWord,
+  listGlossaryAssetsPage,
   mergeGlossaryAssets,
+  mergeGlossaryConflictAndAddWord,
   removeGlossaryConflict,
   removeGlossaryAsset,
   updateGlossaryAsset,
@@ -158,6 +165,11 @@ import "./index.scss";
 
 const backendSuggestionPageSize = 20;
 const defaultSkillListPageSize = 6;
+const defaultGlossaryListPageSize = 4;
+const showGlossaryInboxUi = true;
+const MERGED_GLOSSARY_GROUP_OPTION_ID = "__merged_glossary_group__";
+const MERGED_GLOSSARY_GROUP_OPTION_ID_PREFIX = `${MERGED_GLOSSARY_GROUP_OPTION_ID}:`;
+const NEW_GLOSSARY_GROUP_OPTION_ID = "__new_glossary_group__";
 const isPendingReviewSuggestionStatus = (status?: string) =>
   String(status || "").trim().toLowerCase() === "pending_review";
 const isSkillRemoveSuggestion = (suggestion: EvolutionSuggestionRecord) =>
@@ -195,6 +207,7 @@ const mergeEvolutionSuggestionRecords = (
 
 export default function MemoryManagement() {
   const { t } = useTranslation();
+  const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const tabRouteMatch = useMatch(`${MEMORY_BASE_PATH}/:tab`);
@@ -202,17 +215,24 @@ export default function MemoryManagement() {
   const experienceDetailMatch = useMatch(`${MEMORY_BASE_PATH}/experience/:itemId`);
   const glossaryDetailMatch = useMatch(`${MEMORY_BASE_PATH}/glossary/:itemId`);
   const reviewRouteMatch = useMatch(`${MEMORY_BASE_PATH}/review/:tab/:itemId`);
+  const reviewRouteReloadKeyRef = useRef("");
+  const skillRouteItemId = skillDetailMatch?.params.itemId;
+  const experienceRouteItemId = experienceDetailMatch?.params.itemId;
+  const glossaryRouteItemId = glossaryDetailMatch?.params.itemId;
+  const reviewRouteTab = parseChangeProposalTab(reviewRouteMatch?.params.tab);
+  const reviewRouteItemId = reviewRouteMatch?.params.itemId;
   const routeListTab = parseMemoryTab(tabRouteMatch?.params.tab);
-  const initialRouteTab =
-    (skillDetailMatch?.params.itemId
+  const queryRouteTab = parseMemoryTab(searchParams.get("tab"));
+  const routeMemoryTab =
+    (skillRouteItemId
       ? "skills"
-      : experienceDetailMatch?.params.itemId
+      : experienceRouteItemId
       ? "experience"
-      : glossaryDetailMatch?.params.itemId
+      : glossaryRouteItemId
       ? "glossary"
-      : parseChangeProposalTab(reviewRouteMatch?.params.tab) ||
+      : reviewRouteTab ||
         routeListTab ||
-        parseMemoryTab(searchParams.get("tab")) ||
+        queryRouteTab ||
         "skills") as MemoryTab;
   const initialGlossaryDetailTarget = null;
   const initialReviewProposalId = (() => {
@@ -226,13 +246,21 @@ export default function MemoryManagement() {
       (item) => item.tab === routeTab && item.targetId === routeItemId,
     )?.id;
   })();
-  const [activeTab, setActiveTab] = useState<MemoryTab>(initialRouteTab);
+  const [activeTab, setActiveTab] = useState<MemoryTab>(routeMemoryTab);
   const [developerActive, setDeveloperActive] = useState(isDeveloperModeActive);
   const [toolAssets] = useState<StructuredAsset[]>(initialTools);
   const [skillAssets, setSkillAssets] = useState<StructuredAsset[]>(initialSkills);
   const [skillLoading, setSkillLoading] = useState(false);
   const [skillAutoEvoLoading, setSkillAutoEvoLoading] = useState<Set<string>>(new Set());
   const [skillsInitialized, setSkillsInitialized] = useState(false);
+  const skillListRequestIdRef = useRef(0);
+  const skillListRouteLocationKeyRef = useRef("");
+  const skillListRefreshKeyRef = useRef("");
+  const experienceSectionRefreshKeyRef = useRef("");
+  const glossaryAssetsRefreshKeyRef = useRef("");
+  const glossaryAssetsFilterKeyRef = useRef("");
+  const glossaryAssetsRouteLocationKeyRef = useRef("");
+  const glossaryConflictsRefreshKeyRef = useRef("");
   const [skillListPage, setSkillListPage] = useState(1);
   const [skillListPageSize, setSkillListPageSize] = useState(defaultSkillListPageSize);
   const [skillListTotal, setSkillListTotal] = useState(initialSkills.length);
@@ -248,10 +276,16 @@ export default function MemoryManagement() {
   const [glossaryInitialized, setGlossaryInitialized] = useState(false);
   const [glossaryLoadError, setGlossaryLoadError] = useState("");
   const [glossarySaving, setGlossarySaving] = useState(false);
+  const [glossaryListPage, setGlossaryListPage] = useState(1);
+  const [glossaryListPageSize, setGlossaryListPageSize] = useState(
+    defaultGlossaryListPageSize,
+  );
+  const [glossaryListTotal, setGlossaryListTotal] = useState(0);
   const [query, setQuery] = useState("");
   const [searchInput, setSearchInput] = useState("");
   const [category, setCategory] = useState<string>();
   const [tag, setTag] = useState<string>();
+  const skillKeyword = query.trim();
   const [glossarySource, setGlossarySource] = useState<GlossarySource>();
   const [glossaryInboxOpen, setGlossaryInboxOpen] = useState(false);
   const [glossaryInboxLoading, setGlossaryInboxLoading] = useState(false);
@@ -346,6 +380,7 @@ export default function MemoryManagement() {
   const glossaryRequestIdRef = useRef(0);
   const glossaryConflictRequestIdRef = useRef(0);
   const backendSuggestionLoadMoreRequestIdRef = useRef(0);
+  const activeProposalFieldChangesRef = useRef<ProposalFieldChange[]>([]);
 
   const tabMeta: Record<
     MemoryTab,
@@ -595,14 +630,23 @@ export default function MemoryManagement() {
   const refreshSkillAssets = useCallback(async (
     options: { page?: number; pageSize?: number; preserveChangeProposals?: boolean } = {},
   ) => {
+    const requestId = skillListRequestIdRef.current + 1;
+    skillListRequestIdRef.current = requestId;
     setSkillLoading(true);
 
     try {
       const result = await listSkillAssetsPage({
+        keyword: skillKeyword,
+        category,
+        tags: tag ? [tag] : [],
         page: options.page ?? skillListPage,
         pageSize: options.pageSize ?? skillListPageSize,
       });
       const records = result.records;
+      if (skillListRequestIdRef.current !== requestId) {
+        return;
+      }
+
       setSkillListTotal(result.total);
       setSkillListPage(result.page);
       setSkillListPageSize(result.pageSize);
@@ -635,17 +679,41 @@ export default function MemoryManagement() {
         );
       }
     } catch (error) {
+      if (skillListRequestIdRef.current !== requestId) {
+        return;
+      }
       console.error("Load skill assets failed:", error);
     } finally {
-      setSkillLoading(false);
-      setSkillsInitialized(true);
+      if (skillListRequestIdRef.current === requestId) {
+        setSkillLoading(false);
+        setSkillsInitialized(true);
+      }
     }
-  }, [skillListPage, skillListPageSize]);
+  }, [category, skillKeyword, skillListPage, skillListPageSize, tag]);
 
   const refreshGlossaryAssets = useCallback(
-    async (options?: { keyword?: string; silent?: boolean; source?: GlossarySource }) => {
+    async (options?: {
+      keyword?: string;
+      page?: number;
+      pageSize?: number;
+      silent?: boolean;
+      source?: GlossarySource;
+    }) => {
       const requestId = glossaryRequestIdRef.current + 1;
       glossaryRequestIdRef.current = requestId;
+      const nextPage = Math.max(1, options?.page ?? glossaryListPage);
+      const nextPageSize = Math.max(1, options?.pageSize ?? glossaryListPageSize);
+      const totalForToken = Math.max(glossaryListTotal, (nextPage - 1) * nextPageSize);
+      const pageToken =
+        nextPage > 1
+          ? window.btoa(
+              JSON.stringify({
+                Start: (nextPage - 1) * nextPageSize,
+                Limit: nextPageSize,
+                TotalCount: totalForToken,
+              }),
+            )
+          : "";
 
       if (!options?.silent) {
         setGlossaryLoading(true);
@@ -653,16 +721,21 @@ export default function MemoryManagement() {
       setGlossaryLoadError("");
 
       try {
-        const records = await listGlossaryAssets({
+        const result = await listGlossaryAssetsPage({
           keyword: options?.keyword,
           source: options?.source,
-          pageSize: 200,
+          pageSize: nextPageSize,
+          pageToken,
         });
 
         if (glossaryRequestIdRef.current !== requestId) {
           return;
         }
 
+        const records = result.records;
+        setGlossaryListPage(nextPage);
+        setGlossaryListPageSize(nextPageSize);
+        setGlossaryListTotal(result.total);
         setGlossaryAssets(records);
         setSelectedGlossaryAssetIds((previous) => {
           const validIds = new Set(records.map((item) => item.id));
@@ -697,7 +770,7 @@ export default function MemoryManagement() {
         }
       }
     },
-    [t],
+    [glossaryListPage, glossaryListPageSize, glossaryListTotal, t],
   );
 
   const buildGlossaryProposalFromConflict = useCallback(
@@ -910,12 +983,85 @@ export default function MemoryManagement() {
   );
 
   useEffect(() => {
-    void refreshSkillAssets();
-  }, [refreshSkillAssets]);
+    const shouldRefreshSkillAssets =
+      Boolean(skillRouteItemId) ||
+      reviewRouteTab === "skills" ||
+      routeMemoryTab === "skills";
+
+    if (!shouldRefreshSkillAssets) {
+      return;
+    }
+
+    const isNewSkillListEntry =
+      !skillRouteItemId &&
+      reviewRouteTab !== "skills" &&
+      skillListRouteLocationKeyRef.current !== location.key;
+    const requestPage = isNewSkillListEntry ? 1 : skillListPage;
+    const refreshKey = [
+      location.key,
+      location.pathname,
+      location.search,
+      skillKeyword,
+      category || "",
+      tag || "",
+      requestPage,
+      skillListPageSize,
+    ].join("|");
+
+    if (skillListRefreshKeyRef.current === refreshKey) {
+      return;
+    }
+    skillListRouteLocationKeyRef.current = location.key;
+    skillListRefreshKeyRef.current = refreshKey;
+
+    void refreshSkillAssets({ page: requestPage });
+  }, [
+    category,
+    location.key,
+    location.pathname,
+    location.search,
+    refreshSkillAssets,
+    reviewRouteTab,
+    routeMemoryTab,
+    skillKeyword,
+    skillListPage,
+    skillListPageSize,
+    skillRouteItemId,
+    tag,
+  ]);
 
   useEffect(() => {
-    void refreshExperienceSection({ silent: true });
-  }, [refreshExperienceSection]);
+    const shouldRefreshExperience =
+      Boolean(experienceRouteItemId) ||
+      reviewRouteTab === "experience" ||
+      routeMemoryTab === "experience";
+
+    if (!shouldRefreshExperience) {
+      return;
+    }
+
+    const refreshKey = [
+      location.key,
+      location.pathname,
+      location.search,
+      routeMemoryTab,
+    ].join("|");
+
+    if (experienceSectionRefreshKeyRef.current === refreshKey) {
+      return;
+    }
+    experienceSectionRefreshKeyRef.current = refreshKey;
+
+    void refreshExperienceSection();
+  }, [
+    experienceRouteItemId,
+    location.key,
+    location.pathname,
+    location.search,
+    refreshExperienceSection,
+    reviewRouteTab,
+    routeMemoryTab,
+  ]);
 
   useEffect(() => {
     if (activeTab !== "skills") {
@@ -926,37 +1072,74 @@ export default function MemoryManagement() {
   }, [activeTab, refreshSkillShareCenter]);
 
   useEffect(() => {
-    if (activeTab !== "experience") {
+    if (routeMemoryTab !== "glossary") {
       return;
     }
 
-    void refreshExperienceSection();
-  }, [activeTab, refreshExperienceSection]);
+    const filterKey = [query, glossarySource || ""].join("|");
+    const shouldResetGlossaryPage =
+      glossaryAssetsRouteLocationKeyRef.current !== location.key ||
+      glossaryAssetsFilterKeyRef.current !== filterKey;
+    const requestPage = shouldResetGlossaryPage ? 1 : glossaryListPage;
+    const refreshKey = [
+      location.key,
+      location.pathname,
+      location.search,
+      filterKey,
+      requestPage,
+      glossaryListPageSize,
+    ].join("|");
+
+    if (glossaryAssetsRefreshKeyRef.current === refreshKey) {
+      return;
+    }
+    glossaryAssetsRouteLocationKeyRef.current = location.key;
+    glossaryAssetsFilterKeyRef.current = filterKey;
+    glossaryAssetsRefreshKeyRef.current = refreshKey;
+
+    void refreshGlossaryAssets({
+      keyword: query,
+      page: requestPage,
+      pageSize: glossaryListPageSize,
+      source: glossarySource,
+    });
+  }, [
+    glossaryListPage,
+    glossaryListPageSize,
+    glossarySource,
+    location.key,
+    location.pathname,
+    location.search,
+    query,
+    refreshGlossaryAssets,
+    routeMemoryTab,
+  ]);
 
   useEffect(() => {
-    if (activeTab !== "glossary") {
+    if (routeMemoryTab !== "glossary") {
       return;
     }
 
-    const timer = window.setTimeout(() => {
-      void refreshGlossaryAssets({
-        keyword: query,
-        source: glossarySource,
-      });
-    }, 250);
+    const refreshKey = [
+      location.key,
+      location.pathname,
+      location.search,
+      routeMemoryTab,
+    ].join("|");
 
-    return () => {
-      window.clearTimeout(timer);
-    };
-  }, [activeTab, glossarySource, query, refreshGlossaryAssets]);
-
-  useEffect(() => {
-    if (activeTab !== "glossary") {
+    if (glossaryConflictsRefreshKeyRef.current === refreshKey) {
       return;
     }
+    glossaryConflictsRefreshKeyRef.current = refreshKey;
 
     void refreshGlossaryConflicts({ silent: true });
-  }, [activeTab, refreshGlossaryConflicts]);
+  }, [
+    location.key,
+    location.pathname,
+    location.search,
+    refreshGlossaryConflicts,
+    routeMemoryTab,
+  ]);
 
   useEffect(() => {
     if (!glossaryInboxOpen) {
@@ -965,12 +1148,6 @@ export default function MemoryManagement() {
 
     void refreshGlossaryConflicts({ showErrorToast: true });
   }, [glossaryInboxOpen, refreshGlossaryConflicts]);
-
-  const glossaryRouteItemId = glossaryDetailMatch?.params.itemId;
-  const skillRouteItemId = skillDetailMatch?.params.itemId;
-  const experienceRouteItemId = experienceDetailMatch?.params.itemId;
-  const reviewRouteTab = parseChangeProposalTab(reviewRouteMatch?.params.tab);
-  const reviewRouteItemId = reviewRouteMatch?.params.itemId;
 
   useEffect(() => {
     const syncDeveloperActive = () => {
@@ -1095,6 +1272,7 @@ export default function MemoryManagement() {
   useEffect(() => {
     if (!reviewRouteTab || !reviewRouteItemId) {
       setActiveProposalId(undefined);
+      reviewRouteReloadKeyRef.current = "";
       return;
     }
 
@@ -1106,12 +1284,20 @@ export default function MemoryManagement() {
       return;
     }
 
+    const reviewRouteReloadKey = `${reviewRouteTab}:${reviewRouteItemId}`;
+    if (reviewRouteReloadKeyRef.current === reviewRouteReloadKey) {
+      return;
+    }
+    reviewRouteReloadKeyRef.current = reviewRouteReloadKey;
+
     void (async () => {
       const opened = await openChangeReview(reviewRouteTab, reviewRouteItemId, undefined, {
+        forceReload: true,
         syncRoute: false,
       });
 
       if (!opened) {
+        reviewRouteReloadKeyRef.current = "";
         navigateToMemoryList(reviewRouteTab, { replace: true });
       }
     })();
@@ -1362,6 +1548,8 @@ export default function MemoryManagement() {
     return fieldChanges.filter((item): item is ProposalFieldChange => Boolean(item));
   }, [activeProposal, t]);
 
+  activeProposalFieldChangesRef.current = activeProposalFieldChanges;
+
   useEffect(() => {
     if (!activeProposal) {
       setProposalFieldDecisions({});
@@ -1383,12 +1571,16 @@ export default function MemoryManagement() {
       return;
     }
 
-    const defaults = activeProposalFieldChanges.reduce<
-      Record<string, ProposalFieldDecision>
-    >((result, field) => {
-      result[field.key] = "pending";
-      return result;
-    }, {});
+    const fieldChanges = activeProposal.backendSuggestions
+      ? []
+      : activeProposalFieldChangesRef.current;
+    const defaults = fieldChanges.reduce<Record<string, ProposalFieldDecision>>(
+      (result, field) => {
+        result[field.key] = "pending";
+        return result;
+      },
+      {},
+    );
 
     setProposalFieldDecisions(defaults);
     setSelectedFieldKeys([]);
@@ -1409,7 +1601,8 @@ export default function MemoryManagement() {
     if (activeProposal.tab === "experience") {
       setBackendDraftKind(resolveManagedPreferenceDraftKind(activeProposal.before.resourceType));
     }
-  }, [activeProposal, activeProposalFieldChanges]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProposal?.id]);
 
   useEffect(() => {
     backendSuggestionLoadMoreRequestIdRef.current += 1;
@@ -1621,8 +1814,13 @@ export default function MemoryManagement() {
 
   const keyword = query.trim().toLowerCase();
   const hasStructuredFilter = Boolean(keyword || category || tag);
+  const shouldFilterStructuredItemsLocally = activeTab !== "skills";
   const matchesStructuredFilter = useCallback(
     (item: StructuredAsset) => {
+      if (!shouldFilterStructuredItemsLocally) {
+        return true;
+      }
+
       const matchesKeyword =
         !keyword ||
         item.name.toLowerCase().includes(keyword) ||
@@ -1632,7 +1830,7 @@ export default function MemoryManagement() {
       const matchesTag = !tag || item.tags.includes(tag);
       return matchesKeyword && matchesCategory && matchesTag;
     },
-    [category, keyword, tag],
+    [category, keyword, shouldFilterStructuredItemsLocally, tag],
   );
 
   const filteredExperienceItems = experienceAssets;
@@ -1748,6 +1946,36 @@ export default function MemoryManagement() {
       reader.readAsText(file);
     });
 
+  const appendImportedSkillContent = (existingContent: string, importedContent: string) => {
+    if (!existingContent.trim()) {
+      return importedContent;
+    }
+    if (!importedContent.trim()) {
+      return existingContent;
+    }
+    return `${existingContent.replace(/\s+$/, "")}\n\n${importedContent.replace(/^\s+/, "")}`;
+  };
+
+  const confirmSkillContentImportMode = (existingContent?: string) => {
+    if (!existingContent?.trim()) {
+      return Promise.resolve<"replace" | "append">("replace");
+    }
+
+    return new Promise<"replace" | "append">((resolve) => {
+      Modal.confirm({
+        title: t("admin.memoryUploadSkillContentMergeTitle"),
+        content: t("admin.memoryUploadSkillContentMergeContent"),
+        okText: t("admin.memoryUploadSkillContentMergeReplace"),
+        cancelText: t("admin.memoryUploadSkillContentMergeAppend"),
+        closable: false,
+        maskClosable: false,
+        keyboard: false,
+        onOk: () => resolve("replace"),
+        onCancel: () => resolve("append"),
+      });
+    });
+  };
+
   const handleUploadSkillFile = async (
     file: File,
     options?: {
@@ -1778,6 +2006,14 @@ export default function MemoryManagement() {
         frontMatter && (frontMatter.name || frontMatter.description),
       );
       const importedContent = frontMatter?.content ?? content;
+      const existingContent = childTempId
+        ? draft.childSkills.find((item) => item.tempId === childTempId)?.content
+        : draft.content;
+      const contentImportMode = await confirmSkillContentImportMode(existingContent);
+      const resolveImportedContent = (currentContent: string) =>
+        contentImportMode === "append"
+          ? appendImportedSkillContent(currentContent, importedContent)
+          : importedContent;
 
       const applyMainDraftFromUpload = (replaceFromFrontMatter: boolean) => {
         setDraft((previous) => {
@@ -1785,7 +2021,7 @@ export default function MemoryManagement() {
             return {
               ...previous,
               name: previous.name || inferredName,
-              content: importedContent,
+              content: resolveImportedContent(previous.content),
             };
           }
 
@@ -1800,7 +2036,7 @@ export default function MemoryManagement() {
             ...previous,
             name: nextName,
             description: nextDescription,
-            content: importedContent,
+            content: resolveImportedContent(previous.content),
           };
         });
       };
@@ -1809,7 +2045,7 @@ export default function MemoryManagement() {
           ...previous,
           name: previous.name || frontMatter?.name || inferredName,
           description: previous.description || frontMatter?.description || "",
-          content: importedContent,
+          content: resolveImportedContent(previous.content),
         }));
       };
 
@@ -1822,7 +2058,7 @@ export default function MemoryManagement() {
                   ...item,
                   name: item.name || inferredName,
                   description: item.description || frontMatter?.description || "",
-                  content: importedContent,
+                  content: resolveImportedContent(item.content),
                 }
               : item,
           ),
@@ -2100,10 +2336,12 @@ export default function MemoryManagement() {
     try {
       const enabled = await updatePersonalizationSetting(checked);
       setExperienceFeatureEnabled(enabled);
+      await refreshExperienceSection({ silent: true });
       message.success(t("admin.memoryExperienceSettingSaveSuccess"));
     } catch (error) {
       console.error("Update preference setting failed:", error);
       setExperienceFeatureEnabled(previousValue);
+      await refreshExperienceSection({ silent: true });
       message.error(
         getLocalizedErrorMessage(error, t("admin.memoryExperienceSettingSaveFailed")) ||
           t("admin.memoryExperienceSettingSaveFailed"),
@@ -2175,17 +2413,25 @@ export default function MemoryManagement() {
     tab: ChangeProposalTab,
     itemId: string,
     skillUpdateStatus?: string,
-    options?: { syncRoute?: boolean },
+    options?: { forceReload?: boolean; syncRoute?: boolean },
   ): Promise<boolean> => {
+    if (options?.syncRoute !== false) {
+      reviewRouteReloadKeyRef.current = `${tab}:${itemId}`;
+    }
     const proposal = getPendingProposal(tab, itemId);
-    if (!proposal) {
+    const shouldReloadProposal = options?.forceReload ?? true;
+    if (!proposal || shouldReloadProposal) {
       if (tab === "skills") {
         const matchedSkill = skillAssets.find((item) => item.id === itemId);
         const hasBackendPendingReview = Boolean(
           matchedSkill?.hasPendingReviewSuggestions,
         );
 
-        if (isSkillUpdatePending(skillUpdateStatus) || hasBackendPendingReview) {
+        if (
+          shouldReloadProposal ||
+          isSkillUpdatePending(skillUpdateStatus) ||
+          hasBackendPendingReview
+        ) {
           if (!matchedSkill) {
             message.warning(t("admin.memoryDiffTargetMissing"));
             return false;
@@ -2195,6 +2441,11 @@ export default function MemoryManagement() {
           try {
             const backendProposal = await loadSkillChangeProposal(matchedSkill);
             if (!backendProposal) {
+              setChangeProposals((previous) =>
+                previous.filter(
+                  (item) => !(item.tab === "skills" && item.targetId === itemId),
+                ),
+              );
               message.info(t("admin.memoryDiffNoPending"));
               return false;
             }
@@ -2208,6 +2459,7 @@ export default function MemoryManagement() {
             });
             setActiveProposalId(backendProposal.id);
             if (options?.syncRoute !== false) {
+              reviewRouteReloadKeyRef.current = `${tab}:${itemId}`;
               navigateToChangeReview(tab, itemId);
             }
           } catch (error) {
@@ -2226,9 +2478,10 @@ export default function MemoryManagement() {
 
       if (
         tab === "experience" &&
-        experienceAssets.some(
-          (item) => item.id === itemId && item.hasPendingReviewSuggestions,
-        )
+        (shouldReloadProposal ||
+          experienceAssets.some(
+            (item) => item.id === itemId && item.hasPendingReviewSuggestions,
+          ))
       ) {
         const matchedExperience = experienceAssets.find((item) => item.id === itemId);
         if (!matchedExperience) {
@@ -2240,6 +2493,11 @@ export default function MemoryManagement() {
         try {
           const backendProposal = await loadExperienceChangeProposal(matchedExperience);
           if (!backendProposal) {
+            setChangeProposals((previous) =>
+              previous.filter(
+                (item) => !(item.tab === "experience" && item.targetId === itemId),
+              ),
+            );
             message.info(t("admin.memoryDiffNoPending"));
             return false;
           }
@@ -2256,6 +2514,7 @@ export default function MemoryManagement() {
           });
           setActiveProposalId(backendProposal.id);
           if (options?.syncRoute !== false) {
+            reviewRouteReloadKeyRef.current = `${tab}:${itemId}`;
             navigateToChangeReview(tab, itemId);
           }
         } catch (error) {
@@ -2290,6 +2549,7 @@ export default function MemoryManagement() {
 
     setActiveProposalId(proposal.id);
     if (options?.syncRoute !== false) {
+      reviewRouteReloadKeyRef.current = `${tab}:${itemId}`;
       navigateToChangeReview(tab, itemId);
     }
     return true;
@@ -2384,6 +2644,27 @@ export default function MemoryManagement() {
           backendSuggestionPage: suggestionPage.page,
           backendSuggestionPageSize: suggestionPage.pageSize,
           backendSuggestionTotal: Math.max(mergedSuggestions.length, suggestionPage.total),
+        };
+      }),
+    );
+  };
+  const replaceBackendSuggestionPageInProposal = (
+    proposalId: string,
+    suggestionPage: EvolutionSuggestionListResult,
+  ) => {
+    setChangeProposals((previous) =>
+      previous.map((proposal) => {
+        if (proposal.id !== proposalId) {
+          return proposal;
+        }
+
+        return {
+          ...proposal,
+          backendSuggestionId: suggestionPage.items[0]?.id,
+          backendSuggestions: suggestionPage.items,
+          backendSuggestionPage: suggestionPage.page,
+          backendSuggestionPageSize: suggestionPage.pageSize,
+          backendSuggestionTotal: Math.max(suggestionPage.items.length, suggestionPage.total),
         };
       }),
     );
@@ -2529,13 +2810,19 @@ export default function MemoryManagement() {
       setSelectedBackendSuggestionIds((previous) =>
         previous.filter((item) => item !== suggestionId),
       );
-      if (activeProposal.tab === "experience") {
-        await refreshExperienceAssets({ silent: true });
-      } else {
-        await refreshSkillAssets({ preserveChangeProposals: true });
-      }
       if (decision === "accept") {
         await loadBackendDraftPreview(nextApprovedSuggestionIds);
+        if (activeProposal.tab === "experience") {
+          await refreshExperienceAssets({ silent: true });
+        } else {
+          await refreshSkillAssets({ preserveChangeProposals: true });
+        }
+      } else {
+        if (activeProposal.tab === "experience") {
+          await refreshExperienceAssets({ silent: true });
+        } else {
+          await refreshSkillAssets({ preserveChangeProposals: true });
+        }
       }
     } catch (error) {
       console.error("Submit backend suggestion decision failed:", error);
@@ -2630,14 +2917,20 @@ export default function MemoryManagement() {
       setSelectedBackendSuggestionIds((previous) =>
         previous.filter((item) => !suggestionIds.includes(item)),
       );
-      if (activeProposal.tab === "experience") {
-        await refreshExperienceAssets({ silent: true });
-      } else {
-        await refreshSkillAssets({ preserveChangeProposals: true });
-      }
 
       if (decision === "accept") {
         await loadBackendDraftPreview(nextApprovedSuggestionIds);
+        if (activeProposal.tab === "experience") {
+          await refreshExperienceAssets({ silent: true });
+        } else {
+          await refreshSkillAssets({ preserveChangeProposals: true });
+        }
+      } else {
+        if (activeProposal.tab === "experience") {
+          await refreshExperienceAssets({ silent: true });
+        } else {
+          await refreshSkillAssets({ preserveChangeProposals: true });
+        }
       }
     } catch (error) {
       console.error("Submit backend suggestion batch decision failed:", error);
@@ -2782,7 +3075,29 @@ export default function MemoryManagement() {
           : t("admin.memoryPreferenceDraftDiscardSuccess"),
       );
       setBackendDraftPreview(null);
+      setApprovedBackendSuggestionIds([]);
+      setRejectedBackendSuggestionIds([]);
+      setSelectedBackendSuggestionIds([]);
+      if (activeProposal?.backendSuggestions) {
+        const suggestionPage = await listEvolutionSuggestions({
+          page: 1,
+          pageSize: backendSuggestionPageSize,
+          ...(activeProposal.tab === "skills"
+            ? getSkillSuggestionResourceParam(activeProposal.before)
+            : getPreferenceSuggestionResourceParam(activeProposal.before)),
+        });
+        replaceBackendSuggestionPageInProposal(activeProposal.id, suggestionPage);
+        setSelectedBackendSuggestionIds((previous) => {
+          const latestIds = new Set(suggestionPage.items.map((item) => item.id));
+          return previous.filter((item) => latestIds.has(item));
+        });
+      }
       setActiveReviewStep(0);
+      if (activeProposal?.tab === "skills") {
+        await refreshSkillAssets({ preserveChangeProposals: true });
+      } else {
+        await refreshExperienceSection({ silent: true });
+      }
     } catch (error) {
       console.error("Discard managed draft failed:", error);
       message.error(
@@ -2980,12 +3295,33 @@ export default function MemoryManagement() {
 
   const goToReviewChoose = () => {
     setIsPreviewContentEditing(false);
-    setActiveReviewStep(0);
+    if (!activeProposal?.backendSuggestions) {
+      setActiveReviewStep(0);
+      return;
+    }
+
+    void (async () => {
+      const suggestionPage = await listEvolutionSuggestions({
+        page: 1,
+        pageSize: backendSuggestionPageSize,
+        ...(activeProposal.tab === "skills"
+          ? getSkillSuggestionResourceParam(activeProposal.before)
+          : getPreferenceSuggestionResourceParam(activeProposal.before)),
+      });
+
+      replaceBackendSuggestionPageInProposal(activeProposal.id, suggestionPage);
+      setSelectedBackendSuggestionIds((previous) => {
+        const latestIds = new Set(suggestionPage.items.map((item) => item.id));
+        return previous.filter((item) => latestIds.has(item));
+      });
+      setActiveReviewStep(0);
+    })();
   };
 
   const finishCloseChangeReview = () => {
     setIsPreviewContentEditing(false);
     setActiveProposalId(undefined);
+    reviewRouteReloadKeyRef.current = "";
     navigateToMemoryList(activeProposal?.tab || activeTab);
   };
   const closeChangeReview = () => {
@@ -3242,6 +3578,8 @@ export default function MemoryManagement() {
             await removeGlossaryAsset(item.id);
             await refreshGlossaryAssets({
               keyword: query,
+              page: glossaryListPage,
+              pageSize: glossaryListPageSize,
               source: glossarySource,
               silent: true,
             });
@@ -3292,6 +3630,8 @@ export default function MemoryManagement() {
           await batchRemoveGlossaryAssets(removedIds);
           await refreshGlossaryAssets({
             keyword: query,
+            page: glossaryListPage,
+            pageSize: glossaryListPageSize,
             source: glossarySource,
             silent: true,
           });
@@ -3468,6 +3808,8 @@ export default function MemoryManagement() {
 
         await refreshGlossaryAssets({
           keyword: query,
+          page: glossaryListPage,
+          pageSize: glossaryListPageSize,
           source: glossarySource,
           silent: true,
         });
@@ -3488,6 +3830,8 @@ export default function MemoryManagement() {
           setSelectedGlossaryAssetIds([]);
           await refreshGlossaryAssets({
             keyword: query,
+            page: glossaryListPage,
+            pageSize: glossaryListPageSize,
             source: glossarySource,
             silent: true,
           });
@@ -3504,11 +3848,6 @@ export default function MemoryManagement() {
     } else if (activeTab === "experience") {
       if (!draft.title.trim()) {
         message.warning(`${t("common.pleaseInput")}${t("admin.memoryTitle")}`);
-        return;
-      }
-
-      if (!draft.content.trim()) {
-        message.warning(`${t("common.pleaseInput")}${t("admin.memoryContent")}`);
         return;
       }
 
@@ -3763,6 +4102,7 @@ export default function MemoryManagement() {
           createUserApi().listUsersApiAuthserviceUserGet({
             page: 1,
             pageSize: 200,
+            activeOnly: true,
           }),
           createGroupApi().listGroupsApiAuthserviceGroupGet({
             page: 1,
@@ -3865,7 +4205,9 @@ export default function MemoryManagement() {
             const resolution = resolutions[proposal.id];
             const mode =
               resolution?.mode || (proposal.backendConflictGroupIds?.length ? "separate" : "create");
-            const selectedGroupIds = resolution?.selectedGroupIds?.length
+            const selectedGroupIds = resolution?.mergeGroupIds?.length
+              ? resolution.mergeGroupIds
+              : resolution?.selectedGroupIds?.length
               ? resolution.selectedGroupIds
               : proposal.backendConflictGroupIds || [];
 
@@ -3874,10 +4216,93 @@ export default function MemoryManagement() {
                 throw new Error(t("admin.memoryGlossaryInboxMergeSelectAtLeastTwo"));
               }
 
-              return mergeGlossaryAssetsAndAddConflictWord({
+              const targetGroups = proposal.backendConflictGroups || [];
+              const mergeGroupsFromResolution =
+                resolution?.mergeGroups?.filter((item) => item.length >= 2) || [];
+              const mergeGroups = mergeGroupsFromResolution.length
+                ? mergeGroupsFromResolution
+                : [selectedGroupIds];
+              const fallbackMergedTerm =
+                targetGroups.find((group) => mergeGroups[0]?.includes(group.id))?.term ||
+                proposal.after.term;
+              const fallbackMergedAliases = Array.from(
+                new Set(
+                  targetGroups
+                    .filter((group) => selectedGroupIds.includes(group.id))
+                    .flatMap((group) => [group.term, ...group.aliases]),
+                ),
+              );
+              const fallbackMergedContent = targetGroups
+                .filter((group) => selectedGroupIds.includes(group.id))
+                .map((group) => group.content)
+                .filter(Boolean)
+                .join("\n\n");
+              const mergePayloads = mergeGroups.map((groupIds) => {
+                const draft = resolution?.mergeDrafts?.find(
+                  (item) =>
+                    item.groupIds.length === groupIds.length &&
+                    item.groupIds.every((id) => groupIds.includes(id)),
+                );
+                const term = (
+                  draft?.term ||
+                  resolution?.mergedGroupTerm ||
+                  fallbackMergedTerm
+                ).trim();
+                const aliasesSource = draft?.aliases?.length
+                  ? draft.aliases
+                  : resolution?.mergedGroupAliases?.length
+                    ? resolution.mergedGroupAliases
+                    : fallbackMergedAliases;
+                const description = (
+                  draft?.content ??
+                  resolution?.mergedGroupContent ??
+                  fallbackMergedContent ??
+                  proposal.after.content
+                ).trim();
+                return {
+                  group_ids: groupIds,
+                  term,
+                  aliases: Array.from(
+                    new Set(
+                      aliasesSource
+                        .map((item) => item.trim())
+                        .filter(Boolean),
+                    ),
+                  ),
+                  description,
+                };
+              });
+              const firstMergedGroupIds = mergeGroups
+                .map((groupIds) => groupIds[0])
+                .filter(Boolean);
+              if (!firstMergedGroupIds.length) {
+                throw new Error(t("admin.memoryGlossaryInboxSelectTargetFirst"));
+              }
+              const writeGroupIds = resolution?.writeGroupIds || [];
+              const shouldWriteToMergedGroup =
+                !writeGroupIds.length ||
+                writeGroupIds.some((groupId) => groupId.startsWith(MERGED_GLOSSARY_GROUP_OPTION_ID));
+              const extraWriteGroupIds = writeGroupIds.filter(
+                (groupId) =>
+                  !groupId.startsWith(MERGED_GLOSSARY_GROUP_OPTION_ID_PREFIX) &&
+                  groupId !== MERGED_GLOSSARY_GROUP_OPTION_ID &&
+                  !selectedGroupIds.includes(groupId),
+              );
+              const targetGroupIds = Array.from(
+                new Set([
+                  ...(shouldWriteToMergedGroup ? firstMergedGroupIds : []),
+                  ...extraWriteGroupIds,
+                ]),
+              );
+              if (!targetGroupIds.length) {
+                throw new Error(t("admin.memoryGlossaryInboxSelectTargetFirst"));
+              }
+
+              return mergeGlossaryConflictAndAddWord({
                 id: conflictId,
                 word: conflictWord,
-                groupIds: selectedGroupIds,
+                merges: mergePayloads,
+                group_ids: targetGroupIds,
               });
             }
 
@@ -3893,31 +4318,55 @@ export default function MemoryManagement() {
               });
             }
 
-            const newGroupTerm = (resolution?.newGroupTerm || proposal.after.term).trim();
+            const newGroupTerm = (resolution?.newGroupTerm || "").trim();
             if (!newGroupTerm) {
               throw new Error(t("admin.memoryGlossaryInboxNewGroupRequired"));
             }
-
-            const aliases = [
-              conflictWord,
-              ...proposal.after.aliases,
-            ]
+            const normalizedNewAliases = (resolution?.newGroupAliases?.length
+              ? resolution.newGroupAliases
+              : proposal.after.aliases
+            )
               .map((item) => item.trim())
               .filter(Boolean);
+            if (normalizedNewAliases.some((alias) => alias === newGroupTerm)) {
+              throw new Error("词组归属不允许和其中一个词相同");
+            }
+            const newGroupContent = (resolution?.newGroupContent ?? proposal.after.content).trim();
+            if (newGroupTerm && newGroupContent && newGroupTerm === newGroupContent) {
+              throw new Error("内容不可以和词相同");
+            }
 
-            return createGlossaryAsset(
-              {
-                ...proposal.after,
-                term: newGroupTerm,
-                aliases: [...new Set(aliases)],
-              },
-              { conflictId },
+            const writeGroupIds = resolution?.writeGroupIds || [];
+            const shouldWriteConflictWordToNewGroup =
+              !writeGroupIds.length ||
+              writeGroupIds.includes(NEW_GLOSSARY_GROUP_OPTION_ID);
+            const aliases = [
+              ...(shouldWriteConflictWordToNewGroup ? [conflictWord] : []),
+              ...(resolution?.newGroupAliases?.length
+                ? resolution.newGroupAliases
+                : proposal.after.aliases),
+            ]
+              .map((item) => item.trim())
+              .filter((item) => Boolean(item) && item !== newGroupTerm);
+            const extraWriteGroupIds = writeGroupIds.filter(
+              (groupId) => groupId !== NEW_GLOSSARY_GROUP_OPTION_ID,
             );
+
+            return createGlossaryGroupFromConflict({
+              id: conflictId,
+              word: conflictWord,
+              term: newGroupTerm,
+              aliases: [...new Set(aliases)],
+              description: newGroupContent,
+              group_ids: extraWriteGroupIds.length ? extraWriteGroupIds : undefined,
+            });
           }),
         );
         await Promise.all([
           refreshGlossaryAssets({
             keyword: query,
+            page: glossaryListPage,
+            pageSize: glossaryListPageSize,
             source: glossarySource,
             silent: true,
           }),
@@ -4057,7 +4506,18 @@ export default function MemoryManagement() {
                 </Tag>
               ) : null}
             </div>
-            {!record.parentId ? (
+            {!record.parentId && record.description ? (
+              <Tooltip
+                title={
+                  <div className="memory-text-popover-content">{record.description}</div>
+                }
+                overlayClassName="memory-text-popover"
+                placement="topLeft"
+                trigger="hover"
+              >
+                <div className="memory-table-main-desc">{record.description}</div>
+              </Tooltip>
+            ) : !record.parentId ? (
               <div className="memory-table-main-desc">{record.description}</div>
             ) : null}
           </div>
@@ -4157,7 +4617,8 @@ export default function MemoryManagement() {
         const hasBackendPendingReview =
           activeTab === "skills" &&
           !record.autoEvo &&
-          Boolean(record.hasPendingReviewSuggestions);
+          (Boolean(record.hasPendingReviewSuggestions) ||
+            isPendingReviewSuggestionStatus(record.suggestionStatus));
         const canReviewChange =
           !record.autoEvo &&
           (Boolean(pendingProposal) ||
@@ -4302,11 +4763,23 @@ export default function MemoryManagement() {
       key: "content",
       width: 520,
       className: "memory-content-summary-column",
-      render: (value: string) => (
-        <div className="memory-content-preview memory-content-preview-single-line">
-          {value}
-        </div>
-      ),
+      render: (value: string) =>
+        value ? (
+          <Tooltip
+            title={<div className="memory-text-popover-content">{value}</div>}
+            overlayClassName="memory-text-popover"
+            placement="topLeft"
+            trigger="hover"
+          >
+            <div className="memory-content-preview memory-content-preview-single-line">
+              {value}
+            </div>
+          </Tooltip>
+        ) : (
+          <div className="memory-content-preview memory-content-preview-single-line">
+            {value}
+          </div>
+        ),
     },
     {
       title: t("admin.memoryAutoEvo"),
@@ -4525,6 +4998,9 @@ export default function MemoryManagement() {
     glossaryChangeProposals,
     glossaryAssets,
     glossaryLoading,
+    glossaryListPage,
+    glossaryListPageSize,
+    glossaryListTotal,
     glossaryLoadError,
     refreshGlossaryAssets,
     glossaryRouteItemId,
@@ -4571,6 +5047,8 @@ export default function MemoryManagement() {
     filteredGlossaryItems,
     glossaryColumns,
     selectedGlossaryAssetIds,
+    setGlossaryListPage,
+    setGlossaryListPageSize,
     setSelectedGlossaryAssetIds,
     skillLoading,
     skillsInitialized,
@@ -4657,20 +5135,22 @@ export default function MemoryManagement() {
     <div className={`admin-page memory-page ${isReviewMode ? "is-review-mode" : ""}`}>
       <Outlet context={outletContext} />
 
-      <GlossaryInboxModal
-        t={t}
-        glossaryInboxOpen={glossaryInboxOpen}
-        setGlossaryInboxOpen={setGlossaryInboxOpen}
-        glossaryChangeProposals={glossaryChangeProposals}
-        glossaryInboxLoading={glossaryInboxLoading}
-        glossaryInboxError={glossaryInboxError}
-        glossaryInboxSubmitting={glossaryInboxSubmitting}
-        refreshGlossaryConflicts={refreshGlossaryConflicts}
-        glossarySourceColorMap={glossarySourceColorMap}
-        glossarySourceLabelMap={glossarySourceLabelMap}
-        rejectGlossaryProposals={rejectGlossaryProposals}
-        applyGlossaryProposals={applyGlossaryProposals}
-      />
+      {showGlossaryInboxUi ? (
+        <GlossaryInboxModal
+          t={t}
+          glossaryInboxOpen={glossaryInboxOpen}
+          setGlossaryInboxOpen={setGlossaryInboxOpen}
+          glossaryChangeProposals={glossaryChangeProposals}
+          glossaryInboxLoading={glossaryInboxLoading}
+          glossaryInboxError={glossaryInboxError}
+          glossaryInboxSubmitting={glossaryInboxSubmitting}
+          refreshGlossaryConflicts={refreshGlossaryConflicts}
+          glossarySourceColorMap={glossarySourceColorMap}
+          glossarySourceLabelMap={glossarySourceLabelMap}
+          rejectGlossaryProposals={rejectGlossaryProposals}
+          applyGlossaryProposals={applyGlossaryProposals}
+        />
+      ) : null}
 
       <MemoryDraftModal
         t={t}

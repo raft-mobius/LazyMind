@@ -66,6 +66,7 @@ interface DataSourceWizardModalProps {
   wizardOpen: boolean;
   wizardStep: number;
   form: FormInstance<SourceFormValues>;
+  existingKnowledgeBaseNames: string[];
   selectedType: SourceType | null;
   isFeishuSetupReady: boolean;
   oauthState: OAuthState;
@@ -73,6 +74,7 @@ interface DataSourceWizardModalProps {
   connectionVerified: boolean;
   syncMode: SyncMode;
   feishuTargetType: FeishuTargetType;
+  saving: boolean;
   onClose: () => void;
   onPrev: () => void;
   onNext: () => void;
@@ -91,6 +93,7 @@ export default function DataSourceWizardModal({
   wizardOpen,
   wizardStep,
   form,
+  existingKnowledgeBaseNames,
   selectedType,
   isFeishuSetupReady,
   oauthState,
@@ -98,6 +101,7 @@ export default function DataSourceWizardModal({
   connectionVerified,
   syncMode,
   feishuTargetType,
+  saving,
   onClose,
   onPrev,
   onNext,
@@ -109,6 +113,22 @@ export default function DataSourceWizardModal({
   onTestConnection,
   onInvalidateConnection,
 }: DataSourceWizardModalProps) {
+  const isEditMode = wizardMode === "edit";
+  const existingKnowledgeBaseNameSet = new Set(
+    existingKnowledgeBaseNames.map((name) => name.trim().toLowerCase()).filter(Boolean),
+  );
+
+  const validateKnowledgeBaseName = (_: unknown, value?: string) => {
+    const normalizedValue = `${value || ""}`.trim().toLowerCase();
+    if (!normalizedValue || isEditMode) {
+      return Promise.resolve();
+    }
+    if (existingKnowledgeBaseNameSet.has(normalizedValue)) {
+      return Promise.reject(new Error(t("admin.dataSourceKnowledgeBaseNameDuplicated")));
+    }
+    return Promise.resolve();
+  };
+
   const renderConnectionSection = () => {
     if (!selectedType) {
       return null;
@@ -138,14 +158,14 @@ export default function DataSourceWizardModal({
               type="primary"
               icon={oauthState === "waiting" ? <SyncOutlined spin /> : <LinkOutlined />}
               loading={oauthState === "waiting"}
-              disabled={!isFeishuSetupReady}
+              disabled={isEditMode || !isFeishuSetupReady}
               onClick={onConnectAccount}
             >
               {oauthConnection
                 ? t("admin.dataSourceReconnectAccount")
                 : t("admin.dataSourceConnectAccount")}
             </Button>
-            {oauthState === "waiting" ? (
+            {oauthState === "waiting" && !isEditMode ? (
               <Button onClick={onOpenManualOauthModal}>
                 {t("admin.dataSourceOauthManualCallbackAction")}
               </Button>
@@ -242,7 +262,12 @@ export default function DataSourceWizardModal({
               : t("admin.dataSourceConnectionPending")}
           </Tag>
         </div>
-        <Button type="primary" icon={<LinkOutlined />} onClick={onTestConnection}>
+        <Button
+          type="primary"
+          icon={<LinkOutlined />}
+          disabled={isEditMode}
+          onClick={onTestConnection}
+        >
           {t("admin.dataSourceConnectionTestAction")}
         </Button>
       </Card>
@@ -254,21 +279,27 @@ export default function DataSourceWizardModal({
       title={wizardMode === "edit" ? t("admin.dataSourceEdit") : t("admin.dataSourceCreate")}
       open={wizardOpen}
       width={980}
-      onCancel={onClose}
+      onCancel={() => {
+        if (!saving) {
+          onClose();
+        }
+      }}
       destroyOnHidden
       maskClosable={false}
       footer={
         <div className="data-source-wizard-footer">
-          <Button onClick={onClose}>{t("common.cancel")}</Button>
+          <Button disabled={saving} onClick={onClose}>{t("common.cancel")}</Button>
           <Space>
-            {wizardStep > 0 ? <Button onClick={onPrev}>{t("admin.dataSourceWizardPrev")}</Button> : null}
+            {wizardStep > 0 && !isEditMode ? (
+              <Button disabled={saving} onClick={onPrev}>{t("admin.dataSourceWizardPrev")}</Button>
+            ) : null}
             {wizardStep < 1 ? (
-              <Button type="primary" onClick={onNext}>
+              <Button type="primary" disabled={saving} onClick={onNext}>
                 {t("admin.dataSourceWizardNext")}
               </Button>
             ) : null}
             {wizardStep === 1 ? (
-              <Button type="primary" onClick={onSave}>
+              <Button type="primary" loading={saving} onClick={onSave}>
                 {t("admin.dataSourceSaveConfig")}
               </Button>
             ) : null}
@@ -276,14 +307,16 @@ export default function DataSourceWizardModal({
         </div>
       }
     >
-      <Steps
-        current={wizardStep}
-        items={[
-          { title: t("admin.dataSourceWizardType") },
-          { title: t("admin.dataSourceWizardConnection") },
-        ]}
-        className="data-source-wizard-steps"
-      />
+      {!isEditMode ? (
+        <Steps
+          current={wizardStep}
+          items={[
+            { title: t("admin.dataSourceWizardType") },
+            { title: t("admin.dataSourceWizardConnection") },
+          ]}
+          className="data-source-wizard-steps"
+        />
+      ) : null}
 
       <Form form={form} layout="vertical" className="data-source-wizard-form">
         {wizardStep === 0 ? (
@@ -354,14 +387,26 @@ export default function DataSourceWizardModal({
                     <Form.Item
                       label={t("admin.dataSourceKnowledgeBaseName")}
                       name="knowledgeBase"
+                      extra={
+                        selectedType === "local"
+                          ? t("admin.dataSourceKnowledgeBaseNameLocalHint")
+                          : t("admin.dataSourceKnowledgeBaseNameHint")
+                      }
                       rules={[
                         {
                           required: true,
+                          whitespace: true,
                           message: t("admin.dataSourceKnowledgeBaseNameRequired"),
+                        },
+                        {
+                          validator: validateKnowledgeBaseName,
                         },
                       ]}
                     >
-                      <Input placeholder={t("admin.dataSourceKnowledgeBaseNamePlaceholder")} />
+                      <Input
+                        disabled={isEditMode}
+                        placeholder={t("admin.dataSourceKnowledgeBaseNamePlaceholder")}
+                      />
                     </Form.Item>
                   </Card>
 
@@ -375,8 +420,9 @@ export default function DataSourceWizardModal({
                         ]}
                       >
                         <Input
+                          disabled={isEditMode}
                           placeholder="/mnt/team-share/ops-docs"
-                          onChange={onInvalidateConnection}
+                          onChange={isEditMode ? undefined : onInvalidateConnection}
                         />
                       </Form.Item>
                     ) : (
@@ -392,6 +438,7 @@ export default function DataSourceWizardModal({
                           ]}
                         >
                           <Select
+                            disabled={isEditMode}
                             options={[
                               {
                                 label: t("admin.dataSourceFeishuTargetTypeWiki"),
@@ -415,12 +462,13 @@ export default function DataSourceWizardModal({
                           ]}
                         >
                           <Input
+                            disabled={isEditMode}
                             placeholder={
                               feishuTargetType === "drive_folder"
                                 ? t("admin.dataSourceFeishuTargetPlaceholderDrive")
                                 : t("admin.dataSourceFeishuTargetPlaceholderWiki")
                             }
-                            onChange={onInvalidateConnection}
+                            onChange={isEditMode ? undefined : onInvalidateConnection}
                           />
                         </Form.Item>
                       </>
@@ -473,29 +521,20 @@ export default function DataSourceWizardModal({
                               name="scheduleCycle"
                             >
                               <Select
-                                options={
-                                  selectedType === "feishu"
-                                    ? [
-                                        {
-                                          label: t("admin.dataSourceCycleDaily"),
-                                          value: "daily",
-                                        },
-                                      ]
-                                    : [
-                                        {
-                                          label: t("admin.dataSourceCycleDaily"),
-                                          value: "daily",
-                                        },
-                                        {
-                                          label: t("admin.dataSourceCycleTwoDays"),
-                                          value: "twoDays",
-                                        },
-                                        {
-                                          label: t("admin.dataSourceCycleWeekly"),
-                                          value: "weekly",
-                                        },
-                                      ]
-                                }
+                                options={[
+                                  {
+                                    label: t("admin.dataSourceCycleDaily"),
+                                    value: "daily",
+                                  },
+                                  {
+                                    label: t("admin.dataSourceCycleTwoDays"),
+                                    value: "twoDays",
+                                  },
+                                  {
+                                    label: t("admin.dataSourceCycleWeekly"),
+                                    value: "weekly",
+                                  },
+                                ]}
                               />
                             </Form.Item>
                           </Col>

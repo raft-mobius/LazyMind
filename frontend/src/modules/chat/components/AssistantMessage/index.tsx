@@ -158,12 +158,6 @@ const AssistantMessage = (props: any) => {
     targetHistoryId: undefined,
   });
 
-  const hasFeedback =
-    feedbackState.localFeedbackType ===
-      FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike ||
-    feedbackState.localFeedbackType ===
-      FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike;
-
   useEffect(() => {
     dispatch({ type: "SYNC_FROM_SERVER", feedbackType: item?.feed_back });
   }, [item?.feed_back]);
@@ -214,6 +208,52 @@ const AssistantMessage = (props: any) => {
     );
   }
 
+  function getSourceDisplayIndex(source: any) {
+    const index = source?.index;
+    if (source?.display_index !== undefined && source?.display_index !== null) {
+      return source.display_index;
+    }
+    if (source?.document_index !== undefined && source?.document_index !== null) {
+      return source.document_index;
+    }
+    if (typeof index === "string" && index.includes(".")) {
+      return index.split(".")[0];
+    }
+    return index;
+  }
+
+  function getSourceDocumentKey(source: any, sourceIndex: number) {
+    const displayIndex = getSourceDisplayIndex(source);
+    if (displayIndex !== undefined && displayIndex !== null) {
+      return `${source?.dataset_id || ""}:${source?.file_name || source?.document_id || ""}:${displayIndex}`;
+    }
+    if (source?.document_id) {
+      return `${source?.dataset_id || ""}:${source.document_id}`;
+    }
+    return `source-${sourceIndex}`;
+  }
+
+  function getDocumentSources(sources: Source[]) {
+    const seen = new Set<string>();
+    return Object.values(sources).filter((source: any, sourceIndex: number) => {
+      const key = getSourceDocumentKey(source, sourceIndex);
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function openSource(source: any) {
+    if (source?.dataset_id === "default") {
+      message.error(t("chat.tempFileNotSupportJump"));
+      return;
+    }
+    const url = `/lib/knowledge/knowledge/${source.dataset_id}/${source.document_id}?group_name=${source.group_name}&segement_id=${source.segement_id}&number=${source.segment_number}&from=chat`;
+    window.open(url, "_blank");
+  }
+
   function renderKnowledgeBase() {
     const sources = item.sources as Source[];
     if (!sources || sources.length < 1) {
@@ -221,23 +261,18 @@ const AssistantMessage = (props: any) => {
     }
     return (
       <div className="chat-assistant-msg-knowledge-info">
-        {Object.values(sources).map((source: Source, sourceIndex: number) => {
+        {getDocumentSources(sources).map((source: Source, sourceIndex: number) => {
           return (
             <div
               className="chat-assistant-msg-knowledge"
-              key={source.document_id || `source-${sourceIndex}`}
+              key={getSourceDocumentKey(source, sourceIndex)}
             >
-              <span style={{ marginRight: "8px" }}>{source.index}</span>
+              <span style={{ marginRight: "8px" }}>
+                {getSourceDisplayIndex(source)}
+              </span>
               <span
                 className="knowledgeName"
-                onClick={() => {
-                  if (source?.dataset_id === "default") {
-                    message.error(t("chat.tempFileNotSupportJump"));
-                    return;
-                  }
-                  const url = `/lib/knowledge/knowledge/${source.dataset_id}/${source.document_id}?group_name=${source.group_name}&segement_id=${source.segement_id}&number=${source.segment_number}&from=chat`;
-                  window.open(url, "_blank");
-                }}
+                onClick={() => openSource(source)}
               >
                 {source.file_name}
               </span>
@@ -269,7 +304,7 @@ const AssistantMessage = (props: any) => {
     type: FeedBackChatHistoryRequestTypeEnum,
     historyId?: string,
   ) {
-    if (hasFeedback) {
+    if (feedbackState.isSubmitting) {
       return;
     }
 
@@ -289,10 +324,7 @@ const AssistantMessage = (props: any) => {
       currentFeedBack = item.feed_back;
     }
 
-    if (
-      currentFeedBack === FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike ||
-      currentFeedBack === FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike
-    ) {
+    if (currentFeedBack === type) {
       return;
     }
 
@@ -316,6 +348,10 @@ const AssistantMessage = (props: any) => {
 
   
   function handleDislikeClick(historyId?: string) {
+    if (feedbackState.isSubmitting) {
+      return;
+    }
+
     let currentFeedBack: string | undefined;
     if (historyId && item.answers) {
       const answer = item.answers.find(
@@ -327,7 +363,6 @@ const AssistantMessage = (props: any) => {
     }
 
     if (
-      currentFeedBack === FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike ||
       currentFeedBack === FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike
     ) {
       return;
@@ -436,23 +471,18 @@ const AssistantMessage = (props: any) => {
 
     return (
       <div className="chat-assistant-msg-knowledge-info">
-        {Object.values(sources).map((source: Source, sourceIndex: number) => {
+        {getDocumentSources(sources).map((source: Source, sourceIndex: number) => {
           return (
             <div
               className="chat-assistant-msg-knowledge"
-              key={source.file_id || `source-${sourceIndex}`}
+              key={getSourceDocumentKey(source, sourceIndex)}
             >
-              <span style={{ marginRight: "8px" }}>{source.index}</span>
+              <span style={{ marginRight: "8px" }}>
+                {getSourceDisplayIndex(source)}
+              </span>
               <span
                 className="knowledgeName"
-                onClick={() => {
-                  if (source?.dataset_id === "default") {
-                    message.error(t("chat.tempFileNotSupportJump"));
-                    return;
-                  }
-                  const url = `/lib/knowledge/knowledge/${source.dataset_id}/${source.document_id}?group_name=${source.group_name}&segement_id=${source.segement_id}&number=${source.segment_number}&from=chat`;
-                  window.open(url, "_blank");
-                }}
+                onClick={() => openSource(source)}
               >
                 {source.file_name}
               </span>
@@ -512,25 +542,11 @@ const AssistantMessage = (props: any) => {
               ) : (
                 <LikeOutlined
                   className="tool-btn"
-                  onClick={
-                    answerFeedBack ===
-                    FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike
-                      ? undefined
-                      : () =>
-                          onFeedBack(
-                            FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike,
-                            answerHistoryId,
-                          )
-                  }
-                  style={
-                    answerFeedBack ===
-                    FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike
-                      ? {
-                          cursor: "not-allowed",
-                          opacity: 0.6,
-                          pointerEvents: "none",
-                        }
-                      : {}
+                  onClick={() =>
+                    onFeedBack(
+                      FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike,
+                      answerHistoryId,
+                    )
                   }
                 />
               )}
@@ -547,22 +563,7 @@ const AssistantMessage = (props: any) => {
               ) : (
                 <DislikeOutlined
                   className="tool-btn"
-                  onClick={
-                    answerFeedBack ===
-                    FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike
-                      ? undefined
-                      : () => handleDislikeClick(answerHistoryId)
-                  }
-                  style={
-                    answerFeedBack ===
-                    FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike
-                      ? {
-                          cursor: "not-allowed",
-                          opacity: 0.6,
-                          pointerEvents: "none",
-                        }
-                      : {}
-                  }
+                  onClick={() => handleDislikeClick(answerHistoryId)}
                 />
               )}
             </Flex>
@@ -609,24 +610,10 @@ const AssistantMessage = (props: any) => {
             ) : (
               <LikeOutlined
                 className="tool-btn"
-                onClick={
-                  feedbackState.localFeedbackType ===
-                  FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike
-                    ? undefined
-                    : () =>
-                        onFeedBack(
-                          FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike,
-                        )
-                }
-                style={
-                  feedbackState.localFeedbackType ===
-                  FeedBackChatHistoryRequestTypeEnum.FeedBackTypeUnlike
-                    ? {
-                        cursor: "not-allowed",
-                        opacity: 0.6,
-                        pointerEvents: "none",
-                      }
-                    : {}
+                onClick={() =>
+                  onFeedBack(
+                    FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike,
+                  )
                 }
               />
             )}
@@ -643,22 +630,7 @@ const AssistantMessage = (props: any) => {
             ) : (
               <DislikeOutlined
                 className="tool-btn"
-                onClick={
-                  feedbackState.localFeedbackType ===
-                  FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike
-                    ? undefined
-                    : () => handleDislikeClick()
-                }
-                style={
-                  feedbackState.localFeedbackType ===
-                  FeedBackChatHistoryRequestTypeEnum.FeedBackTypeLike
-                    ? {
-                        cursor: "not-allowed",
-                        opacity: 0.6,
-                        pointerEvents: "none",
-                      }
-                    : {}
-                }
+                onClick={() => handleDislikeClick()}
               />
             )}
           </Flex>

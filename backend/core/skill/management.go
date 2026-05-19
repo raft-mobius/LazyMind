@@ -13,20 +13,29 @@ import (
 
 	"gorm.io/gorm"
 
-	"lazyrag/core/algo"
-	"lazyrag/core/common"
-	"lazyrag/core/common/orm"
-	"lazyrag/core/evolution"
-	appLog "lazyrag/core/log"
-	"lazyrag/core/store"
+	"lazymind/core/algo"
+	"lazymind/core/common"
+	"lazymind/core/common/orm"
+	"lazymind/core/evolution"
+	appLog "lazymind/core/log"
+	"lazymind/core/store"
 )
 
 var (
 	errDraftPreviewParentOnly  = errors.New("only parent skill supports draft preview")
 	errDraftPreviewNotFound    = errors.New("skill draft not found")
 	errAutoEvoApplyConflict    = errors.New("auto_evo apply conflict")
+	errAutoEvoTaskRunning      = errors.New("auto_evo task is running")
 	errPendingRemoveSuggestion = errors.New("skill has pending remove suggestion")
 )
+
+func normalizedSkillUpdateStatus(status string) string {
+	status = strings.TrimSpace(status)
+	if status == "" || status == "pending_confirm" {
+		return evolution.UpdateStatusUpToDate
+	}
+	return status
+}
 
 func List(w http.ResponseWriter, r *http.Request) {
 	db := store.DB()
@@ -56,7 +65,10 @@ func List(w http.ResponseWriter, r *http.Request) {
 		common.ReplyErr(w, "query skills failed", http.StatusInternalServerError)
 		return
 	}
-	suggestionStatesByKey, err := loadSuggestionStatesByKey(r.Context(), db, userID, parents)
+	suggestionRows := make([]orm.SkillResource, 0, len(parents)+len(children))
+	suggestionRows = append(suggestionRows, parents...)
+	suggestionRows = append(suggestionRows, children...)
+	suggestionStatesByKey, err := loadSuggestionStatesByKey(r.Context(), db, userID, suggestionRows)
 	if err != nil {
 		common.ReplyErr(w, "query skills failed", http.StatusInternalServerError)
 		return
@@ -71,7 +83,8 @@ func List(w http.ResponseWriter, r *http.Request) {
 	keyword := strings.TrimSpace(r.URL.Query().Get("keyword"))
 	category := strings.TrimSpace(r.URL.Query().Get("category"))
 	filterTags := compactStrings(r.URL.Query()["tags"])
-	filtered := make([]map[string]any, 0, len(parents))
+	filtered := make([]skillListParentEntry, 0, len(parents))
+	total := 0
 	for _, parent := range parents {
 		if keyword != "" && !strings.Contains(strings.ToLower(parent.SkillName), strings.ToLower(keyword)) && !strings.Contains(strings.ToLower(parent.Description), strings.ToLower(keyword)) {
 			continue
@@ -84,7 +97,12 @@ func List(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		key := parent.Category + "/" + parent.SkillName
-		filtered = append(filtered, parentListResponse(parent, childMap[key], suggestionStatesByKey[skillSuggestionResourceKey(parent)]))
+		childrenForParent := childMap[key]
+		total++
+		filtered = append(filtered, skillListParentEntry{
+			parent:   parent,
+			children: childrenForParent,
+		})
 	}
 
 	page := parsePositiveInt(r.URL.Query().Get("page"), 1)
@@ -92,18 +110,14 @@ func List(w http.ResponseWriter, r *http.Request) {
 	if pageSize > 100 {
 		pageSize = 100
 	}
-	total := len(filtered)
-	start := (page - 1) * pageSize
-	if start > total {
-		start = total
-	}
-	end := start + pageSize
-	if end > total {
-		end = total
+	pageItems := paginateSkillListParents(filtered, page, pageSize)
+	items := make([]map[string]any, 0, len(pageItems))
+	for _, item := range pageItems {
+		items = append(items, parentListResponse(item.parent, item.children, suggestionStatesByKey))
 	}
 
 	common.ReplyOK(w, map[string]any{
-		"items":     filtered[start:end],
+		"items":     items,
 		"page":      page,
 		"page_size": pageSize,
 		"total":     total,
@@ -126,7 +140,7 @@ func Get(w http.ResponseWriter, r *http.Request) {
 		common.ReplyErr(w, "missing skill_id", http.StatusBadRequest)
 		return
 	}
-	item, err := getSkillDetail(r.Context(), db, userID, skillID)
+	item, err := getReadableSkillDetail(r.Context(), db, userID, skillID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			common.ReplyErr(w, "skill not found", http.StatusNotFound)
@@ -158,17 +172,20 @@ func CreateManaged(w http.ResponseWriter, r *http.Request) {
 	req.Name = strings.TrimSpace(req.Name)
 	req.Description = strings.TrimSpace(req.Description)
 	req.Category = strings.TrimSpace(req.Category)
+	req.ParentSkillID = strings.TrimSpace(req.ParentSkillID)
 	req.ParentSkillName = strings.TrimSpace(req.ParentSkillName)
 	req.Content = strings.TrimSpace(req.Content)
+	isChildCreate := req.ParentSkillID != "" || req.ParentSkillName != ""
 	appLog.Logger.Info().
 		Str("route", "POST /api/core/skills").
 		Str("user_id", userID).
 		Str("category", req.Category).
 		Str("name", req.Name).
+		Str("parent_skill_id", req.ParentSkillID).
 		Str("parent_skill_name", req.ParentSkillName).
 		Int("children_count", len(req.Children)).
 		Msg("direct skill management create requested")
-	if req.Name == "" || req.Category == "" || req.Content == "" {
+	if req.Name == "" || req.Content == "" || (!isChildCreate && req.Category == "") {
 		common.ReplyErr(w, "name/category/content required", http.StatusBadRequest)
 		return
 	}
@@ -176,39 +193,54 @@ func CreateManaged(w http.ResponseWriter, r *http.Request) {
 		common.ReplyErr(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := validatePathSegment(req.Category); err != nil {
-		common.ReplyErr(w, err.Error(), http.StatusBadRequest)
-		return
+	if !isChildCreate || req.ParentSkillID == "" {
+		if err := validatePathSegment(req.Category); err != nil {
+			common.ReplyErr(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
-	if req.ParentSkillName == "" {
+	createdSkillID := ""
+	if !isChildCreate {
 		if err := createParentSkill(r.Context(), db, userID, userName, req); err != nil {
 			replySkillError(w, err)
 			return
 		}
 	} else {
-		if err := validatePathSegment(req.ParentSkillName); err != nil {
-			common.ReplyErr(w, err.Error(), http.StatusBadRequest)
+		if req.ParentSkillID == "" && req.ParentSkillName == "" {
+			common.ReplyErr(w, "parent_skill_id required", http.StatusBadRequest)
 			return
+		}
+		if req.ParentSkillID == "" {
+			if err := validatePathSegment(req.ParentSkillName); err != nil {
+				common.ReplyErr(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 		if len(req.Children) > 0 {
 			common.ReplyErr(w, "children is not allowed when creating child skill", http.StatusBadRequest)
 			return
 		}
-		if err := createChildSkill(r.Context(), db, userID, userName, req); err != nil {
+		row, err := createChildSkill(r.Context(), db, userID, userName, req)
+		if err != nil {
 			replySkillError(w, err)
 			return
 		}
+		createdSkillID = row.ID
 	}
 
-	relativePath := parentRelativePath(req.Category, req.Name)
-	if req.ParentSkillName != "" {
-		relativePath = childRelativePath(req.Category, req.ParentSkillName, req.Name, req.FileExt)
-	}
 	var row orm.SkillResource
-	if err := db.WithContext(r.Context()).Where("owner_user_id = ? AND relative_path = ?", userID, relativePath).Take(&row).Error; err != nil {
-		common.ReplyErr(w, "query skill failed", http.StatusInternalServerError)
-		return
+	if createdSkillID != "" {
+		if err := db.WithContext(r.Context()).Where("id = ? AND owner_user_id = ?", createdSkillID, userID).Take(&row).Error; err != nil {
+			common.ReplyErr(w, "query skill failed", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		relativePath := parentRelativePath(req.Category, req.Name)
+		if err := db.WithContext(r.Context()).Where("owner_user_id = ? AND relative_path = ?", userID, relativePath).Take(&row).Error; err != nil {
+			common.ReplyErr(w, "query skill failed", http.StatusInternalServerError)
+			return
+		}
 	}
 	item, err := getSkillDetail(r.Context(), db, userID, row.ID)
 	if err != nil {
@@ -221,6 +253,7 @@ func CreateManaged(w http.ResponseWriter, r *http.Request) {
 		Str("skill_id", row.ID).
 		Str("category", req.Category).
 		Str("name", req.Name).
+		Str("parent_skill_id", req.ParentSkillID).
 		Str("parent_skill_name", req.ParentSkillName).
 		Msg("direct skill management create executed")
 	common.ReplyOK(w, item)
@@ -341,14 +374,19 @@ func Generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, err := storedSkillContent(row)
+	useDraft := len(req.SuggestionIDs) == 0 && req.UserInstruct != ""
+	content, err := skillGenerateBaseContent(row, useDraft)
 	if err != nil {
-		common.ReplyErr(w, "read skill content failed", http.StatusInternalServerError)
+		if errors.Is(err, errDraftPreviewNotFound) {
+			common.ReplyErr(w, err.Error(), http.StatusNotFound)
+		} else {
+			common.ReplyErr(w, "read skill content failed", http.StatusInternalServerError)
+		}
 		return
 	}
 	var suggestions []orm.ResourceSuggestion
 	if len(req.SuggestionIDs) > 0 {
-		suggestions, err = evolution.LoadApprovedSuggestions(r.Context(), db, userID, evolution.ResourceTypeSkill, row.RelativePath, req.SuggestionIDs)
+		suggestions, err = evolution.LoadApprovedSuggestions(r.Context(), db, userID, evolution.ResourceTypeSkill, skillSuggestionResourceKey(row), req.SuggestionIDs)
 		if err != nil {
 			common.ReplyErr(w, "query suggestions failed", http.StatusInternalServerError)
 			return
@@ -373,11 +411,18 @@ func Generate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	generated, err := algo.GenerateSkill(r.Context(), algo.SkillGenerateRequest{
+	algoReq := algo.SkillGenerateRequest{
 		Content:      content,
 		Suggestions:  toAlgoSuggestions(suggestions),
 		UserInstruct: req.UserInstruct,
-	})
+	}
+	appLog.Logger.Info().
+		Str("route", "/skills/{skill_id}:generate").
+		Str("skill_id", row.ID).
+		Str("user_id", userID).
+		Str("payload", payloadForLog(algoReq)).
+		Msg("requesting external skill generate")
+	generated, err := algo.GenerateSkill(r.Context(), algoReq)
 	if err != nil {
 		common.ReplyErr(w, "skill generate failed: "+err.Error(), http.StatusBadGateway)
 		return
@@ -388,14 +433,18 @@ func Generate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
+	ids := suggestionIDs(suggestions)
+	if useDraft && len(ids) == 0 {
+		ids = evolution.DraftSuggestionIDs(row.Ext)
+	}
 	update := map[string]any{
 		"draft_source_version": row.Version,
 		"draft_content":        generated,
 		"draft_status":         "pending_confirm",
 		"draft_updated_at":     now,
-		"update_status":        "pending_confirm",
+		"update_status":        evolution.UpdateStatusUpToDate,
 		"updated_at":           now,
-		"ext":                  evolution.WithDraftSuggestionIDs(row.Ext, suggestionIDs(suggestions)),
+		"ext":                  evolution.WithDraftSuggestionIDs(row.Ext, ids),
 	}
 	if err := db.WithContext(r.Context()).Model(&orm.SkillResource{}).Where("id = ?", row.ID).Updates(update).Error; err != nil {
 		common.ReplyErr(w, "update skill draft failed", http.StatusInternalServerError)
@@ -403,13 +452,27 @@ func Generate(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = db.WithContext(r.Context()).Model(&orm.SkillResource{}).
 		Where("owner_user_id = ? AND node_type = ? AND category = ? AND parent_skill_name = ?", userID, evolution.SkillNodeTypeChild, row.Category, row.SkillName).
-		Updates(map[string]any{"update_status": "pending_confirm", "updated_at": now}).Error
+		Updates(map[string]any{"update_status": evolution.UpdateStatusUpToDate, "updated_at": now}).Error
 	common.ReplyOK(w, generateSkillResponse{
 		DraftStatus:        "pending_confirm",
 		DraftSourceVersion: row.Version,
 		DraftPath:          "",
 		Outdated:           outdated,
 	})
+}
+
+func skillGenerateBaseContent(row orm.SkillResource, useDraft bool) (string, error) {
+	if !useDraft {
+		return storedSkillContent(row)
+	}
+	if strings.TrimSpace(row.DraftStatus) != "pending_confirm" {
+		return "", errDraftPreviewNotFound
+	}
+	content := row.DraftContent
+	if strings.TrimSpace(content) == "" {
+		return "", errors.New("read skill draft failed")
+	}
+	return content, nil
 }
 
 func DraftPreview(w http.ResponseWriter, r *http.Request) {
@@ -555,7 +618,6 @@ func Discard(w http.ResponseWriter, r *http.Request) {
 		common.ReplyErr(w, "skill draft not found", http.StatusNotFound)
 		return
 	}
-	ids := evolution.DraftSuggestionIDs(row.Ext)
 	now := time.Now()
 	update := map[string]any{
 		"draft_source_version": 0,
@@ -573,11 +635,98 @@ func Discard(w http.ResponseWriter, r *http.Request) {
 	_ = db.WithContext(r.Context()).Model(&orm.SkillResource{}).
 		Where("owner_user_id = ? AND node_type = ? AND category = ? AND parent_skill_name = ?", userID, evolution.SkillNodeTypeChild, row.Category, row.SkillName).
 		Updates(map[string]any{"update_status": evolution.UpdateStatusUpToDate, "updated_at": now}).Error
-	if err := evolution.UpdateSuggestionStatus(r.Context(), db, ids, evolution.SuggestionStatusDiscarded); err != nil {
-		common.ReplyErr(w, "update suggestion status failed", http.StatusInternalServerError)
-		return
-	}
 	common.ReplyOK(w, map[string]any{"discarded": true})
+}
+
+func getReadableSkillDetail(ctx context.Context, db *gorm.DB, userID, skillID string) (map[string]any, error) {
+	var row orm.SkillResource
+	if err := db.WithContext(ctx).Where("id = ?", skillID).Take(&row).Error; err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(row.OwnerUserID) == strings.TrimSpace(userID) {
+		return getSkillDetail(ctx, db, row.OwnerUserID, skillID)
+	}
+
+	allowed, err := hasSharedSkillReadAccess(ctx, db, userID, row)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return getSkillDetail(ctx, db, row.OwnerUserID, skillID)
+}
+
+func hasSharedSkillReadAccess(ctx context.Context, db *gorm.DB, userID string, row orm.SkillResource) (bool, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return false, nil
+	}
+
+	rootSkill, err := sharedSkillRoot(ctx, db, row)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if strings.TrimSpace(rootSkill.ID) == "" {
+		return false, nil
+	}
+
+	sourceMatch := db.Where("skill_share_tasks.source_skill_id = ?", rootSkill.ID)
+	sourceRelativeRoot := filepath.ToSlash(filepath.Join(strings.TrimSpace(rootSkill.Category), strings.TrimSpace(rootSkill.SkillName)))
+	if sourceRelativeRoot != "" && sourceRelativeRoot != "." {
+		sourceMatch = sourceMatch.Or("skill_share_tasks.source_relative_root = ?", sourceRelativeRoot)
+	}
+	if strings.TrimSpace(rootSkill.Category) != "" && strings.TrimSpace(rootSkill.SkillName) != "" {
+		sourceMatch = sourceMatch.Or("skill_share_tasks.source_category = ? AND skill_share_tasks.source_parent_skill_name = ?", rootSkill.Category, rootSkill.SkillName)
+	}
+
+	var count int64
+	if err := db.WithContext(ctx).
+		Model(&orm.SkillShareItem{}).
+		Joins("JOIN skill_share_tasks ON skill_share_tasks.id = skill_share_items.share_task_id").
+		Where("skill_share_items.target_user_id = ?", userID).
+		Where("skill_share_tasks.source_user_id = ?", rootSkill.OwnerUserID).
+		Where(sourceMatch).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func sharedSkillRoot(ctx context.Context, db *gorm.DB, row orm.SkillResource) (orm.SkillResource, error) {
+	if row.NodeType == evolution.SkillNodeTypeParent {
+		return row, nil
+	}
+	if row.NodeType != evolution.SkillNodeTypeChild {
+		return orm.SkillResource{}, nil
+	}
+
+	parentName := strings.TrimSpace(row.ParentSkillName)
+	if parentName == "" {
+		return orm.SkillResource{}, nil
+	}
+	var parent orm.SkillResource
+	if err := db.WithContext(ctx).
+		Where("owner_user_id = ? AND node_type = ? AND category = ? AND skill_name = ?", row.OwnerUserID, evolution.SkillNodeTypeParent, row.Category, parentName).
+		Take(&parent).Error; err != nil {
+		return orm.SkillResource{}, err
+	}
+	return parent, nil
+}
+
+func parentForChild(ctx context.Context, db *gorm.DB, child orm.SkillResource) (orm.SkillResource, error) {
+	parentName := strings.TrimSpace(child.ParentSkillName)
+	if parentName == "" {
+		return orm.SkillResource{}, gorm.ErrRecordNotFound
+	}
+	var parent orm.SkillResource
+	err := db.WithContext(ctx).
+		Where("owner_user_id = ? AND node_type = ? AND category = ? AND skill_name = ?", child.OwnerUserID, evolution.SkillNodeTypeParent, child.Category, parentName).
+		Take(&parent).Error
+	return parent, err
 }
 
 func getSkillDetail(ctx context.Context, db *gorm.DB, userID, skillID string) (map[string]any, error) {
@@ -585,7 +734,18 @@ func getSkillDetail(ctx context.Context, db *gorm.DB, userID, skillID string) (m
 	if err := db.WithContext(ctx).Where("id = ? AND owner_user_id = ?", skillID, userID).Take(&row).Error; err != nil {
 		return nil, err
 	}
-	suggestionStatesByKey, err := loadSuggestionStatesByKey(ctx, db, userID, []orm.SkillResource{row})
+	suggestionRows := []orm.SkillResource{row}
+	if row.NodeType == evolution.SkillNodeTypeParent {
+		var children []orm.SkillResource
+		if err := db.WithContext(ctx).
+			Where("owner_user_id = ? AND node_type = ? AND category = ? AND parent_skill_name = ?", userID, evolution.SkillNodeTypeChild, row.Category, row.SkillName).
+			Order("created_at ASC").
+			Find(&children).Error; err != nil {
+			return nil, err
+		}
+		suggestionRows = append(suggestionRows, children...)
+	}
+	suggestionStatesByKey, err := loadSuggestionStatesByKey(ctx, db, userID, suggestionRows)
 	if err != nil {
 		return nil, err
 	}
@@ -605,14 +765,22 @@ func getSkillDetail(ctx context.Context, db *gorm.DB, userID, skillID string) (m
 		"auto_evo_generation":            row.AutoEvoGeneration,
 		"auto_evo_error":                 row.AutoEvoError,
 		"is_enabled":                     row.IsEnabled,
-		"update_status":                  row.UpdateStatus,
+		"update_status":                  normalizedSkillUpdateStatus(row.UpdateStatus),
 		"has_pending_review_suggestions": suggestionState.Status == evolution.SuggestionStatusPendingReview,
 		"has_pending_remove_suggestion":  suggestionState.HasPendingRemove,
 		"suggestion_status":              suggestionState.Status,
 		"node_type":                      row.NodeType,
+		"parent_id":                      "",
+		"parent_skill_id":                "",
 		"parent_skill_name":              row.ParentSkillName,
 		"content":                        content,
 		"file_ext":                       row.FileExt,
+	}
+	if row.NodeType == evolution.SkillNodeTypeChild {
+		if parent, err := parentForChild(ctx, db, row); err == nil {
+			item["parent_id"] = parent.ID
+			item["parent_skill_id"] = parent.ID
+		}
 	}
 	if row.NodeType == evolution.SkillNodeTypeParent {
 		var children []orm.SkillResource
@@ -624,22 +792,26 @@ func getSkillDetail(ctx context.Context, db *gorm.DB, userID, skillID string) (m
 		}
 		childItems := make([]map[string]any, 0, len(children))
 		for _, child := range children {
+			childSuggestionState := canonicalSkillSuggestionState(suggestionStatesByKey[skillSuggestionResourceKey(child)])
 			childContent, _ := storedSkillContent(child)
 			childItems = append(childItems, map[string]any{
 				"skill_id":                       child.ID,
 				"name":                           child.SkillName,
 				"description":                    child.Description,
+				"tags":                           parseTags(child.Tags),
 				"file_ext":                       child.FileExt,
 				"auto_evo":                       child.AutoEvo,
 				"auto_evo_apply_status":          evolution.NormalizeAutoEvoApplyStatus(child.AutoEvoApplyStatus),
 				"auto_evo_generation":            child.AutoEvoGeneration,
 				"auto_evo_error":                 child.AutoEvoError,
 				"is_enabled":                     child.IsEnabled,
-				"update_status":                  child.UpdateStatus,
-				"has_pending_review_suggestions": suggestionState.Status == evolution.SuggestionStatusPendingReview,
-				"has_pending_remove_suggestion":  suggestionState.HasPendingRemove,
-				"suggestion_status":              suggestionState.Status,
+				"update_status":                  normalizedSkillUpdateStatus(child.UpdateStatus),
+				"has_pending_review_suggestions": childSuggestionState.Status == evolution.SuggestionStatusPendingReview,
+				"has_pending_remove_suggestion":  childSuggestionState.HasPendingRemove,
+				"suggestion_status":              childSuggestionState.Status,
 				"node_type":                      child.NodeType,
+				"parent_id":                      row.ID,
+				"parent_skill_id":                row.ID,
 				"parent_skill_name":              child.ParentSkillName,
 				"content":                        childContent,
 			})
@@ -700,7 +872,7 @@ func draftSuggestionsOutdated(ctx context.Context, db *gorm.DB, row orm.SkillRes
 		return false, nil
 	}
 
-	suggestions, err := evolution.LoadApprovedSuggestions(ctx, db, row.OwnerUserID, evolution.ResourceTypeSkill, row.RelativePath, ids)
+	suggestions, err := evolution.LoadApprovedSuggestions(ctx, db, row.OwnerUserID, evolution.ResourceTypeSkill, skillSuggestionResourceKey(row), ids)
 	if err != nil {
 		return false, err
 	}
@@ -729,6 +901,15 @@ func createParentSkill(ctx context.Context, db *gorm.DB, userID, userName string
 func createParentSkillWithContent(ctx context.Context, db *gorm.DB, userID, userName string, req createSkillRequest, fullContent, description string) error {
 	relPath := parentRelativePath(req.Category, req.Name)
 	var count int64
+	if err := db.WithContext(ctx).
+		Model(&orm.SkillResource{}).
+		Where("owner_user_id = ? AND node_type = ? AND skill_name = ?", userID, evolution.SkillNodeTypeParent, req.Name).
+		Count(&count).Error; err != nil {
+		return err
+	}
+	if count > 0 {
+		return gorm.ErrDuplicatedKey
+	}
 	if err := db.WithContext(ctx).Model(&orm.SkillResource{}).Where("owner_user_id = ? AND relative_path = ?", userID, relPath).Count(&count).Error; err != nil {
 		return err
 	}
@@ -783,7 +964,8 @@ func createParentSkillWithContent(ctx context.Context, db *gorm.DB, userID, user
 			ParentSkillName: req.Name,
 			SkillName:       child.Name,
 			NodeType:        evolution.SkillNodeTypeChild,
-			Description:     "",
+			Description:     strings.TrimSpace(child.Description),
+			Tags:            tagsJSON(child.Tags),
 			FileExt:         ext,
 			RelativePath:    rel,
 			Content:         child.Content,
@@ -816,32 +998,54 @@ func createParentSkillWithContent(ctx context.Context, db *gorm.DB, userID, user
 	return nil
 }
 
-func createChildSkill(ctx context.Context, db *gorm.DB, userID, userName string, req createSkillRequest) error {
+func resolveParentSkill(ctx context.Context, db *gorm.DB, userID, parentSkillID, category, parentSkillName string) (orm.SkillResource, error) {
+	parentSkillID = strings.TrimSpace(parentSkillID)
+	parentSkillName = strings.TrimSpace(parentSkillName)
+	category = strings.TrimSpace(category)
 	var parent orm.SkillResource
-	if err := db.WithContext(ctx).
-		Where("owner_user_id = ? AND node_type = ? AND category = ? AND skill_name = ?", userID, evolution.SkillNodeTypeParent, req.Category, req.ParentSkillName).
-		Take(&parent).Error; err != nil {
-		return err
+	if parentSkillID != "" {
+		err := db.WithContext(ctx).
+			Where("id = ? AND owner_user_id = ? AND node_type = ?", parentSkillID, userID, evolution.SkillNodeTypeParent).
+			Take(&parent).Error
+		return parent, err
+	}
+	if parentSkillName == "" {
+		return orm.SkillResource{}, errors.New("parent_skill_id required")
+	}
+	query := db.WithContext(ctx).
+		Where("owner_user_id = ? AND node_type = ? AND skill_name = ?", userID, evolution.SkillNodeTypeParent, parentSkillName)
+	if category != "" {
+		query = query.Where("category = ?", category)
+	}
+	err := query.Take(&parent).Error
+	return parent, err
+}
+
+func createChildSkill(ctx context.Context, db *gorm.DB, userID, userName string, req createSkillRequest) (orm.SkillResource, error) {
+	parent, err := resolveParentSkill(ctx, db, userID, req.ParentSkillID, req.Category, req.ParentSkillName)
+	if err != nil {
+		return orm.SkillResource{}, err
 	}
 	ext := normalizeExt(req.FileExt)
-	relPath := childRelativePath(req.Category, req.ParentSkillName, req.Name, ext)
+	relPath := childRelativePath(parent.Category, parent.SkillName, req.Name, ext)
 	var count int64
 	if err := db.WithContext(ctx).Model(&orm.SkillResource{}).Where("owner_user_id = ? AND relative_path = ?", userID, relPath).Count(&count).Error; err != nil {
-		return err
+		return orm.SkillResource{}, err
 	}
 	if count > 0 {
-		return gorm.ErrDuplicatedKey
+		return orm.SkillResource{}, gorm.ErrDuplicatedKey
 	}
 	now := time.Now()
 	row := orm.SkillResource{
 		ID:              evolution.BuildSuggestionRecord("", "", "", "", "", "").ID,
 		OwnerUserID:     userID,
 		OwnerUserName:   userName,
-		Category:        req.Category,
-		ParentSkillName: req.ParentSkillName,
+		Category:        parent.Category,
+		ParentSkillName: parent.SkillName,
 		SkillName:       req.Name,
 		NodeType:        evolution.SkillNodeTypeChild,
-		Description:     "",
+		Description:     strings.TrimSpace(req.Description),
+		Tags:            tagsJSON(req.Tags),
 		FileExt:         ext,
 		RelativePath:    relPath,
 		Content:         req.Content,
@@ -851,22 +1055,25 @@ func createChildSkill(ctx context.Context, db *gorm.DB, userID, userName string,
 		Version:         1,
 		AutoEvo:         req.AutoEvo,
 		IsEnabled:       parent.IsEnabled,
-		UpdateStatus:    parent.UpdateStatus,
+		UpdateStatus:    normalizedSkillUpdateStatus(parent.UpdateStatus),
 		CreateUserID:    userID,
 		CreateUserName:  userName,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
 	if err := db.WithContext(ctx).Create(&row).Error; err != nil {
-		return err
+		return orm.SkillResource{}, err
 	}
-	return nil
+	return row, nil
 }
 
 func updateSkill(ctx context.Context, db *gorm.DB, userID, userName, skillID string, req updateSkillRequest) error {
 	var row orm.SkillResource
 	if err := db.WithContext(ctx).Where("id = ? AND owner_user_id = ?", skillID, userID).Take(&row).Error; err != nil {
 		return err
+	}
+	if req.AutoEvo != nil && evolution.HasAutoEvoWorker(evolution.AutoEvoWorkerKey(evolution.ResourceTypeSkill, row.ID)) {
+		return errAutoEvoTaskRunning
 	}
 	if row.NodeType == evolution.SkillNodeTypeParent {
 		return updateParentSkill(ctx, db, userID, userName, &row, req)
@@ -919,9 +1126,55 @@ func deleteChildSkill(ctx context.Context, db *gorm.DB, row *orm.SkillResource) 
 	})
 }
 
+func enableParentSkillAutoEvoWithDiscardedDraft(ctx context.Context, db *gorm.DB, row *orm.SkillResource) error {
+	now := time.Now()
+	update := map[string]any{
+		"auto_evo":              true,
+		"auto_evo_generation":   gorm.Expr("auto_evo_generation + 1"),
+		"auto_evo_apply_status": evolution.AutoEvoApplyStatusIdle,
+		"auto_evo_error":        "",
+		"auto_evo_finished_at":  nil,
+		"draft_content":         "",
+		"draft_source_version":  0,
+		"draft_status":          "",
+		"draft_updated_at":      nil,
+		"update_status":         evolution.UpdateStatusUpToDate,
+		"updated_at":            now,
+		"ext":                   evolution.WithDraftSuggestionIDs(row.Ext, nil),
+	}
+	if err := db.WithContext(ctx).Model(&orm.SkillResource{}).Where("id = ?", row.ID).Updates(update).Error; err != nil {
+		return err
+	}
+	_ = db.WithContext(ctx).Model(&orm.SkillResource{}).
+		Where("owner_user_id = ? AND node_type = ? AND category = ? AND parent_skill_name = ?",
+			row.OwnerUserID, evolution.SkillNodeTypeChild, row.Category, row.SkillName).
+		Updates(map[string]any{"update_status": evolution.UpdateStatusUpToDate, "updated_at": now}).Error
+	var refreshed orm.SkillResource
+	if err := db.WithContext(ctx).Where("id = ?", row.ID).Take(&refreshed).Error; err != nil {
+		return err
+	}
+	if err := ensureSkillAutoEvolutionScheduled(refreshed); err != nil {
+		appLog.Logger.Warn().Err(err).Str("skill_id", row.ID).Msg("auto_evo schedule on PATCH failed")
+	}
+	return nil
+}
+
 func updateParentSkill(ctx context.Context, db *gorm.DB, userID, userName string, row *orm.SkillResource, req updateSkillRequest) error {
-	if strings.TrimSpace(row.DraftStatus) == "pending_confirm" {
+	pendingDraft := strings.TrimSpace(row.DraftStatus) == "pending_confirm"
+	if pendingDraft && req.AutoEvo != nil && *req.AutoEvo {
+		if err := ensureNoPendingRemoveSuggestionForAutoEvo(ctx, db, userID, *row); err != nil {
+			return err
+		}
+		return enableParentSkillAutoEvoWithDiscardedDraft(ctx, db, row)
+	}
+	if pendingDraft {
 		return errors.New("parent skill has pending_confirm draft")
+	}
+	if req.ParentSkillID != nil {
+		return errors.New("parent_skill_id cannot be updated")
+	}
+	if req.ParentSkillName != nil {
+		return errors.New("parent_skill_name cannot be updated")
 	}
 	if req.AutoEvo != nil && *req.AutoEvo {
 		if err := ensureNoPendingRemoveSuggestionForAutoEvo(ctx, db, userID, *row); err != nil {
@@ -967,6 +1220,17 @@ func updateParentSkill(ctx context.Context, db *gorm.DB, userID, userName string
 	newDescription = resolvedDescription
 	if oldCategory != newCategory || oldName != newName {
 		var count int64
+		if oldName != newName {
+			if err := db.WithContext(ctx).
+				Model(&orm.SkillResource{}).
+				Where("owner_user_id = ? AND node_type = ? AND skill_name = ? AND id <> ?", userID, evolution.SkillNodeTypeParent, newName, row.ID).
+				Count(&count).Error; err != nil {
+				return err
+			}
+			if count > 0 {
+				return gorm.ErrDuplicatedKey
+			}
+		}
 		newRelativePath := parentRelativePath(newCategory, newName)
 		if err := db.WithContext(ctx).
 			Model(&orm.SkillResource{}).
@@ -1055,11 +1319,11 @@ func updateParentSkill(ctx context.Context, db *gorm.DB, userID, userName string
 }
 
 func updateChildSkill(ctx context.Context, db *gorm.DB, userID string, row *orm.SkillResource, req updateSkillRequest) error {
-	if req.Name != nil {
-		return errors.New("child skill name is immutable")
+	if req.Category != nil && strings.TrimSpace(*req.Category) != strings.TrimSpace(row.Category) {
+		return errors.New("child skill category is immutable")
 	}
-	if req.Category != nil || req.Tags != nil || req.IsEnabled != nil || req.Description != nil {
-		return errors.New("child skill only supports content/file_ext/auto_evo updates")
+	if req.Category != nil || req.IsEnabled != nil {
+		return errors.New("child skill only supports name/description/tags/content/file_ext/auto_evo/parent_skill_id updates")
 	}
 	if req.AutoEvo != nil && *req.AutoEvo {
 		if err := ensureNoPendingRemoveSuggestionForAutoEvo(ctx, db, userID, *row); err != nil {
@@ -1070,26 +1334,91 @@ func updateChildSkill(ctx context.Context, db *gorm.DB, userID string, row *orm.
 	if err != nil {
 		return err
 	}
+	newName := row.SkillName
+	if req.Name != nil {
+		newName = strings.TrimSpace(*req.Name)
+		if err := validatePathSegment(newName); err != nil {
+			return err
+		}
+	}
 	newContent := currentContent
 	if req.Content != nil {
 		newContent = *req.Content
+	}
+	newDescription := row.Description
+	if req.Description != nil {
+		newDescription = strings.TrimSpace(*req.Description)
+	}
+	newTags := row.Tags
+	if req.Tags != nil {
+		newTags = tagsJSON(*req.Tags)
 	}
 	newExt := row.FileExt
 	if req.FileExt != nil {
 		newExt = normalizeExt(*req.FileExt)
 	}
+	newCategory := row.Category
+	newParentSkillName := row.ParentSkillName
+	var newParent *orm.SkillResource
+	if req.ParentSkillID != nil || req.ParentSkillName != nil {
+		parentSkillID := ""
+		if req.ParentSkillID != nil {
+			parentSkillID = strings.TrimSpace(*req.ParentSkillID)
+			if parentSkillID == "" {
+				return errors.New("parent_skill_id required")
+			}
+		}
+		parentSkillName := ""
+		if req.ParentSkillName != nil {
+			parentSkillName = strings.TrimSpace(*req.ParentSkillName)
+			if parentSkillID == "" {
+				if parentSkillName == "" {
+					return errors.New("parent_skill_name required")
+				}
+				if err := validatePathSegment(parentSkillName); err != nil {
+					return err
+				}
+			}
+		}
+		parent, err := resolveParentSkill(ctx, db, userID, parentSkillID, "", parentSkillName)
+		if err != nil {
+			return err
+		}
+		newParent = &parent
+		newCategory = parent.Category
+		newParentSkillName = parent.SkillName
+	}
 	newRelative := row.RelativePath
-	if newExt != row.FileExt {
-		newRelative = childRelativePath(row.Category, row.ParentSkillName, row.SkillName, newExt)
+	if newName != row.SkillName || newExt != row.FileExt || newCategory != row.Category || newParentSkillName != row.ParentSkillName {
+		newRelative = childRelativePath(newCategory, newParentSkillName, newName, newExt)
+		var count int64
+		if err := db.WithContext(ctx).
+			Model(&orm.SkillResource{}).
+			Where("owner_user_id = ? AND relative_path = ? AND id <> ?", userID, newRelative, row.ID).
+			Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return gorm.ErrDuplicatedKey
+		}
 	}
 	update := map[string]any{
-		"file_ext":      newExt,
-		"relative_path": newRelative,
-		"content":       newContent,
-		"content_size":  skillContentSize(newContent),
-		"mime_type":     mimeTypeForExt(newExt),
-		"content_hash":  evolution.HashContent(newContent),
-		"updated_at":    time.Now(),
+		"skill_name":        newName,
+		"category":          newCategory,
+		"parent_skill_name": newParentSkillName,
+		"file_ext":          newExt,
+		"relative_path":     newRelative,
+		"description":       newDescription,
+		"tags":              newTags,
+		"content":           newContent,
+		"content_size":      skillContentSize(newContent),
+		"mime_type":         mimeTypeForExt(newExt),
+		"content_hash":      evolution.HashContent(newContent),
+		"updated_at":        time.Now(),
+	}
+	if newParent != nil {
+		update["is_enabled"] = newParent.IsEnabled
+		update["update_status"] = normalizedSkillUpdateStatus(newParent.UpdateStatus)
 	}
 	if req.AutoEvo != nil {
 		update["auto_evo"] = *req.AutoEvo
@@ -1124,27 +1453,12 @@ func updateChildSkill(ctx context.Context, db *gorm.DB, userID string, row *orm.
 	return nil
 }
 
-func parentListResponse(parent orm.SkillResource, children []orm.SkillResource, suggestionState skillSuggestionState) map[string]any {
-	suggestionState = canonicalSkillSuggestionState(suggestionState)
+func parentListResponse(parent orm.SkillResource, children []orm.SkillResource, suggestionStatesByKey map[string]skillSuggestionState) map[string]any {
+	parentSuggestionState := canonicalSkillSuggestionState(suggestionStatesByKey[skillSuggestionResourceKey(parent)])
 	childItems := make([]map[string]any, 0, len(children))
 	sort.Slice(children, func(i, j int) bool { return children[i].CreatedAt.Before(children[j].CreatedAt) })
 	for _, child := range children {
-		childItems = append(childItems, map[string]any{
-			"skill_id":                       child.ID,
-			"name":                           child.SkillName,
-			"description":                    child.Description,
-			"file_ext":                       child.FileExt,
-			"auto_evo":                       child.AutoEvo,
-			"auto_evo_apply_status":          evolution.NormalizeAutoEvoApplyStatus(child.AutoEvoApplyStatus),
-			"auto_evo_generation":            child.AutoEvoGeneration,
-			"auto_evo_error":                 child.AutoEvoError,
-			"is_enabled":                     parent.IsEnabled,
-			"update_status":                  parent.UpdateStatus,
-			"has_pending_review_suggestions": suggestionState.Status == evolution.SuggestionStatusPendingReview,
-			"has_pending_remove_suggestion":  suggestionState.HasPendingRemove,
-			"suggestion_status":              suggestionState.Status,
-			"node_type":                      child.NodeType,
-		})
+		childItems = append(childItems, childListResponse(parent, child, suggestionStatesByKey))
 	}
 	return map[string]any{
 		"skill_id":                       parent.ID,
@@ -1157,13 +1471,57 @@ func parentListResponse(parent orm.SkillResource, children []orm.SkillResource, 
 		"auto_evo_generation":            parent.AutoEvoGeneration,
 		"auto_evo_error":                 parent.AutoEvoError,
 		"is_enabled":                     parent.IsEnabled,
-		"update_status":                  parent.UpdateStatus,
-		"has_pending_review_suggestions": suggestionState.Status == evolution.SuggestionStatusPendingReview,
-		"has_pending_remove_suggestion":  suggestionState.HasPendingRemove,
-		"suggestion_status":              suggestionState.Status,
+		"update_status":                  normalizedSkillUpdateStatus(parent.UpdateStatus),
+		"has_pending_review_suggestions": parentSuggestionState.Status == evolution.SuggestionStatusPendingReview,
+		"has_pending_remove_suggestion":  parentSuggestionState.HasPendingRemove,
+		"suggestion_status":              parentSuggestionState.Status,
 		"node_type":                      parent.NodeType,
 		"children":                       childItems,
 	}
+}
+
+func childListResponse(parent, child orm.SkillResource, suggestionStatesByKey map[string]skillSuggestionState) map[string]any {
+	childSuggestionState := canonicalSkillSuggestionState(suggestionStatesByKey[skillSuggestionResourceKey(child)])
+	return map[string]any{
+		"skill_id":                       child.ID,
+		"name":                           child.SkillName,
+		"description":                    child.Description,
+		"category":                       parent.Category,
+		"tags":                           parseTags(child.Tags),
+		"parent_id":                      parent.ID,
+		"parent_skill_id":                parent.ID,
+		"parent_skill_name":              parent.SkillName,
+		"file_ext":                       child.FileExt,
+		"auto_evo":                       child.AutoEvo,
+		"auto_evo_apply_status":          evolution.NormalizeAutoEvoApplyStatus(child.AutoEvoApplyStatus),
+		"auto_evo_generation":            child.AutoEvoGeneration,
+		"auto_evo_error":                 child.AutoEvoError,
+		"is_enabled":                     parent.IsEnabled,
+		"update_status":                  normalizedSkillUpdateStatus(parent.UpdateStatus),
+		"has_pending_review_suggestions": childSuggestionState.Status == evolution.SuggestionStatusPendingReview,
+		"has_pending_remove_suggestion":  childSuggestionState.HasPendingRemove,
+		"suggestion_status":              childSuggestionState.Status,
+		"node_type":                      child.NodeType,
+	}
+}
+
+type skillListParentEntry struct {
+	parent   orm.SkillResource
+	children []orm.SkillResource
+}
+
+func paginateSkillListParents(entries []skillListParentEntry, page, pageSize int) []skillListParentEntry {
+	total := len(entries)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+
+	return entries[start:end]
 }
 
 type skillSuggestionState struct {
@@ -1186,9 +1544,7 @@ func mergeSkillSuggestionState(current skillSuggestionState, status, action stri
 
 func loadSuggestionStatesByKey(ctx context.Context, db *gorm.DB, userID string, skillRows []orm.SkillResource) (map[string]skillSuggestionState, error) {
 	targetKeys := make(map[string]struct{}, len(skillRows))
-	targetsByCategoryAndParent := make(map[string][]string, len(skillRows))
 	keys := make([]string, 0, len(skillRows))
-	categories := make([]string, 0, len(skillRows))
 	for _, row := range skillRows {
 		key := skillSuggestionResourceKey(row)
 		if key == "" {
@@ -1196,15 +1552,8 @@ func loadSuggestionStatesByKey(ctx context.Context, db *gorm.DB, userID string, 
 		}
 		targetKeys[key] = struct{}{}
 		keys = append(keys, key)
-		category := strings.TrimSpace(row.Category)
-		parentName := firstNonEmpty(strings.TrimSpace(row.ParentSkillName), strings.TrimSpace(row.SkillName))
-		if category != "" && parentName != "" {
-			targetsByCategoryAndParent[skillSuggestionCategoryParentKey(category, parentName)] = append(targetsByCategoryAndParent[skillSuggestionCategoryParentKey(category, parentName)], key)
-			categories = append(categories, category)
-		}
 	}
 	keys = compactStrings(keys)
-	categories = compactStrings(categories)
 	if len(keys) == 0 {
 		return map[string]skillSuggestionState{}, nil
 	}
@@ -1226,32 +1575,16 @@ func loadSuggestionStatesByKey(ctx context.Context, db *gorm.DB, userID string, 
 			evolution.ResourceTypeSkill,
 			evolution.VisibleSuggestionStatuses(),
 		)
-	if len(categories) > 0 {
-		query = query.Where("(resource_key IN ? OR relative_path IN ? OR category IN ?)", keys, keys, categories)
-	} else {
-		query = query.Where("(resource_key IN ? OR relative_path IN ?)", keys, keys)
-	}
+	query = query.Where("resource_key IN ?", keys)
 	if err := query.Find(&rows).Error; err != nil {
 		return nil, err
 	}
 
 	result := make(map[string]skillSuggestionState, len(rows))
 	for _, row := range rows {
-		key := filepath.ToSlash(strings.TrimSpace(row.ResourceKey))
-		if key == "" {
-			key = filepath.ToSlash(strings.TrimSpace(row.RelativePath))
-		}
+		key := strings.TrimSpace(row.ResourceKey)
 		if _, ok := targetKeys[key]; ok {
 			result[key] = mergeSkillSuggestionState(result[key], row.Status, row.Action)
-			continue
-		}
-		category := strings.TrimSpace(row.Category)
-		parentName := firstNonEmpty(strings.TrimSpace(row.ParentSkillName), strings.TrimSpace(row.SkillName))
-		if category == "" || parentName == "" {
-			continue
-		}
-		for _, targetKey := range targetsByCategoryAndParent[skillSuggestionCategoryParentKey(category, parentName)] {
-			result[targetKey] = mergeSkillSuggestionState(result[targetKey], row.Status, row.Action)
 		}
 	}
 	return result, nil
@@ -1271,10 +1604,6 @@ func skillSuggestionResourceKeys(rows []orm.SkillResource) []string {
 
 func skillSuggestionResourceKey(row orm.SkillResource) string {
 	return evolution.SkillSuggestionResourceKey(row)
-}
-
-func skillSuggestionCategoryParentKey(category, parentName string) string {
-	return strings.TrimSpace(category) + "\x00" + strings.TrimSpace(parentName)
 }
 
 func containsAllTags(have, need []string) bool {
@@ -1335,7 +1664,7 @@ func suggestionIDs(rows []orm.ResourceSuggestion) []string {
 
 func hasPendingRemoveSuggestion(rows []orm.ResourceSuggestion) bool {
 	for _, row := range rows {
-		if strings.TrimSpace(row.Action) == evolution.SuggestionActionRemove && strings.TrimSpace(row.Status) == evolution.SuggestionStatusPendingReview {
+		if strings.TrimSpace(row.Action) == evolution.SuggestionActionRemove {
 			return true
 		}
 	}
@@ -1372,7 +1701,7 @@ func ensureNoPendingRemoveSuggestionForAutoEvo(ctx context.Context, db *gorm.DB,
 	if resourceKey == "" {
 		return nil
 	}
-	pending, err := evolution.LoadPendingReviewSuggestions(ctx, db, userID, evolution.ResourceTypeSkill, resourceKey)
+	pending, err := evolution.LoadAutoApplicableSuggestions(ctx, db, userID, evolution.ResourceTypeSkill, resourceKey)
 	if err != nil {
 		return err
 	}
@@ -1399,7 +1728,7 @@ func applySkillAutoEvolution(ctx context.Context, db *gorm.DB, row orm.SkillReso
 		return false, nil
 	}
 
-	pending, err := evolution.LoadPendingReviewSuggestions(ctx, db, row.OwnerUserID, evolution.ResourceTypeSkill, resourceKey)
+	pending, err := evolution.LoadAutoApplicableSuggestions(ctx, db, row.OwnerUserID, evolution.ResourceTypeSkill, resourceKey)
 	if err != nil {
 		return false, err
 	}
@@ -1513,7 +1842,7 @@ func ensureSkillAutoEvolutionScheduled(row orm.SkillResource) error {
 		return nil
 	}
 
-	pending, err := evolution.LoadPendingReviewSuggestions(context.Background(), db, latest.OwnerUserID, evolution.ResourceTypeSkill, evolution.SkillSuggestionResourceKey(latest))
+	pending, err := evolution.LoadAutoApplicableSuggestions(context.Background(), db, latest.OwnerUserID, evolution.ResourceTypeSkill, evolution.SkillSuggestionResourceKey(latest))
 	if err != nil {
 		evolution.ReleaseAutoEvoWorker(workerKey)
 		return err
@@ -1575,7 +1904,7 @@ func runSkillAutoEvolutionLoop(skillID, workerKey string) {
 			return
 		}
 
-		pending, err := evolution.LoadPendingReviewSuggestions(ctx, db, row.OwnerUserID, evolution.ResourceTypeSkill, evolution.SkillSuggestionResourceKey(row))
+		pending, err := evolution.LoadAutoApplicableSuggestions(ctx, db, row.OwnerUserID, evolution.ResourceTypeSkill, evolution.SkillSuggestionResourceKey(row))
 		if err != nil {
 			_ = db.WithContext(ctx).Model(&orm.SkillResource{}).Where("id = ?", row.ID).Updates(map[string]any{
 				"auto_evo_apply_status": evolution.AutoEvoApplyStatusFailed,
@@ -1635,10 +1964,12 @@ func replySkillError(w http.ResponseWriter, err error) {
 		common.ReplyErr(w, "skill already exists", http.StatusConflict)
 	case errors.Is(err, errPendingRemoveSuggestion):
 		common.ReplyErr(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, errAutoEvoTaskRunning):
+		common.ReplyErr(w, err.Error(), http.StatusConflict)
 	default:
 		message := strings.TrimSpace(err.Error())
 		status := http.StatusBadRequest
-		if strings.Contains(message, "failed") || strings.Contains(message, "invalid") || strings.Contains(message, "required") || strings.Contains(message, "immutable") || strings.Contains(message, "supports") || strings.Contains(message, "pending_confirm") {
+		if strings.Contains(message, "failed") || strings.Contains(message, "invalid") || strings.Contains(message, "required") || strings.Contains(message, "immutable") || strings.Contains(message, "supports") || strings.Contains(message, "pending_confirm") || strings.Contains(message, "cannot") {
 			status = http.StatusBadRequest
 		} else {
 			status = http.StatusInternalServerError

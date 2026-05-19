@@ -14,8 +14,8 @@ import (
 
 	"gorm.io/gorm"
 
-	"lazyrag/core/common/orm"
-	appLog "lazyrag/core/log"
+	"lazymind/core/common/orm"
+	appLog "lazymind/core/log"
 )
 
 type SkillState struct {
@@ -58,15 +58,19 @@ func ParentSkillRelativePath(category, skillName string) string {
 	return filepath.ToSlash(filepath.Join(category, skillName, "SKILL.md"))
 }
 
+func ChildSkillRelativePath(category, parentSkillName, skillName, fileExt string) string {
+	category = strings.TrimSpace(category)
+	parentSkillName = strings.TrimSpace(parentSkillName)
+	skillName = strings.TrimSpace(skillName)
+	fileExt = strings.TrimSpace(strings.TrimPrefix(fileExt, "."))
+	if fileExt == "" {
+		fileExt = "md"
+	}
+	return filepath.ToSlash(filepath.Join(category, parentSkillName, fmt.Sprintf("%s.%s", skillName, strings.ToLower(fileExt))))
+}
+
 func SkillSuggestionResourceKey(row orm.SkillResource) string {
-	if strings.TrimSpace(row.NodeType) == SkillNodeTypeChild {
-		return ParentSkillRelativePath(strings.TrimSpace(row.Category), firstNonEmpty(strings.TrimSpace(row.ParentSkillName), strings.TrimSpace(row.SkillName)))
-	}
-	resourceKey := strings.TrimSpace(row.RelativePath)
-	if resourceKey == "" {
-		resourceKey = ParentSkillRelativePath(strings.TrimSpace(row.Category), firstNonEmpty(strings.TrimSpace(row.ParentSkillName), strings.TrimSpace(row.SkillName)))
-	}
-	return filepath.ToSlash(resourceKey)
+	return strings.TrimSpace(row.ID)
 }
 
 func SystemResourceKey(resourceType string) string {
@@ -249,7 +253,7 @@ func BuildChatResourceContext(ctx context.Context, db *gorm.DB, userID, userName
 			SessionID:       sessionID,
 			UserID:          userID,
 			ResourceType:    ResourceTypeSkill,
-			ResourceKey:     state.RelativePath,
+			ResourceKey:     SkillSuggestionResourceKey(skill),
 			Category:        strings.TrimSpace(skill.Category),
 			ParentSkillName: parentName,
 			SkillName:       strings.TrimSpace(skill.SkillName),
@@ -327,6 +331,24 @@ func FindSnapshot(ctx context.Context, db *gorm.DB, sessionID, resourceType, res
 	return &row, nil
 }
 
+func FindSkillSnapshotByIdentity(ctx context.Context, db *gorm.DB, sessionID, userID, category, skillName string) (*orm.ResourceSessionSnapshot, error) {
+	var row orm.ResourceSessionSnapshot
+	if err := db.WithContext(ctx).
+		Where(
+			"session_id = ? AND user_id = ? AND resource_type = ? AND category = ? AND (skill_name = ? OR parent_skill_name = ?)",
+			strings.TrimSpace(sessionID),
+			strings.TrimSpace(userID),
+			ResourceTypeSkill,
+			strings.TrimSpace(category),
+			strings.TrimSpace(skillName),
+			strings.TrimSpace(skillName),
+		).
+		Take(&row).Error; err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
 func loadLegacySystemMemoryTemplate(ctx context.Context, tx *gorm.DB, userID string) (orm.SystemMemory, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
@@ -364,10 +386,9 @@ func loadLegacySystemUserPreferenceTemplate(ctx context.Context, tx *gorm.DB, us
 func LoadSkillStateByResourceKey(ctx context.Context, db *gorm.DB, userID, resourceKey string) (*SkillState, error) {
 	var skill orm.SkillResource
 	err := db.WithContext(ctx).
-		Where("owner_user_id = ? AND relative_path = ? AND node_type = ?",
+		Where("owner_user_id = ? AND id = ?",
 			strings.TrimSpace(userID),
-			filepath.ToSlash(strings.TrimSpace(resourceKey)),
-			SkillNodeTypeParent,
+			strings.TrimSpace(resourceKey),
 		).
 		Take(&skill).Error
 	if err != nil {
@@ -439,10 +460,22 @@ func skillStateFromResource(skill *orm.SkillResource) (*SkillState, error) {
 
 func conversationIDFromSessionID(sessionID string) string {
 	sessionID = strings.TrimSpace(sessionID)
-	if idx := strings.LastIndex(sessionID, "_"); idx > 0 {
+	if idx := strings.LastIndex(sessionID, "_"); idx > 0 && isTimestampSuffix(sessionID[idx+1:]) {
 		return sessionID[:idx]
 	}
 	return sessionID
+}
+
+func isTimestampSuffix(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func firstNonEmpty(values ...string) string {

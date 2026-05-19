@@ -8,7 +8,7 @@ import (
 
 	"go.uber.org/zap"
 
-	internal "github.com/lazyrag/file_watcher/internal"
+	internal "github.com/lazymind/file_watcher/internal"
 )
 
 type reconcileScannerStub struct {
@@ -92,5 +92,17 @@ func TestReconcilerPersistsAndLoadsSnapshot(t *testing.T) {
 	defer reporterB.mu.Unlock()
 	if len(reporterB.events) == 0 {
 		t.Fatalf("expected reconcile events after loading persisted snapshot")
+	}
+}
+
+func TestParseReconcileScheduleExprAcceptsSeconds(t *testing.T) {
+	t.Parallel()
+
+	schedule, err := parseReconcileScheduleExpr("daily@02:00:00")
+	if err != nil {
+		t.Fatalf("parse schedule with seconds failed: %v", err)
+	}
+	if schedule.everyDays != 1 || schedule.hour != 2 || schedule.minute != 0 {
+		t.Fatalf("unexpected schedule: %#v", schedule)
 	}
 }

@@ -37,12 +37,21 @@ import {
   type DataSourceDetailState,
   type DataSourceSummary,
   type DocumentStatusRow,
+  type SourceStateValue,
+  type SyncStateValue,
+  buildDocumentStatusDetail,
   formatBytes,
   formatDateTime,
-  isDataSourceUpdateState,
+  getFileUpdateMeta,
+  getSourceStateMeta,
+  getSyncStateMeta,
   normalizeDataSourceFileUpdateState,
   normalizeDataSourceParseStatus,
   normalizeDataSourceStatus,
+  normalizePendingAction,
+  resolveSourceState,
+  resolveSyncState,
+  sourceStateToFileUpdate,
 } from "./shared";
 
 const { Text } = Typography;
@@ -228,35 +237,6 @@ function getParseStatusMeta(status: DocumentStatusRow["parseStatus"], t: TFuncti
   };
 }
 
-function getUpdateStateMeta(status: DocumentStatusRow["updateState"], t: TFunction) {
-  if (status === "new") {
-    return {
-      text: t("admin.dataSourceFileUpdateNew"),
-      detail: t("admin.dataSourceFileUpdateNewDetail"),
-      tone: "new" as const,
-    };
-  }
-  if (status === "changed") {
-    return {
-      text: t("admin.dataSourceFileUpdateChangedDetailTitle"),
-      detail: t("admin.dataSourceFileUpdateChangedDetail"),
-      tone: "changed" as const,
-    };
-  }
-  if (status === "deleted") {
-    return {
-      text: t("admin.dataSourceFileUpdateDeletedDetailTitle"),
-      detail: t("admin.dataSourceFileUpdateDeletedDetail"),
-      tone: "deleted" as const,
-    };
-  }
-  return {
-    text: t("admin.dataSourceFileUpdateUnchanged"),
-    detail: t("admin.dataSourceFileUpdateUnchangedDetail"),
-    tone: "unchanged" as const,
-  };
-}
-
 function isDocumentNeedSync(status: DocumentStatusRow["updateState"]) {
   return status === "new" || status === "changed" || status === "deleted";
 }
@@ -310,10 +290,9 @@ function mapScanSyncDetail(updateState: DocumentStatusRow["updateState"]) {
 }
 
 function mapScanDocumentToDetail(item: ScanSourceDocumentItem): DocumentStatusRow {
-  const updateState = normalizeDataSourceFileUpdateState(
-    item.update_type,
-    item.has_update,
-  );
+  const sourceState = resolveSourceState(item);
+  const syncState = resolveSyncState(item);
+  const updateState = sourceStateToFileUpdate(sourceState);
   const parseState = [
     item.parse_state,
     item.core_task_state,
@@ -333,6 +312,12 @@ function mapScanDocumentToDetail(item: ScanSourceDocumentItem): DocumentStatusRo
     parseStatus: normalizeDataSourceParseStatus(parseState),
     sourceUpdatedAt: lastSyncedAt || "-",
     updatedAt: lastSyncedAt || "-",
+    sourceState,
+    syncState,
+    pendingAction: normalizePendingAction(item.pending_action),
+    nextSyncAt: item.next_sync_at,
+    lastError: item.last_error,
+    knowledgeBasePresent: item.knowledge_base_present,
   };
 }
 
@@ -373,58 +358,12 @@ function buildDetailSummaryFromSource(
   };
 }
 
-function isTreeNodeUpdated(node: ScanTreeNode) {
-  return isDataSourceUpdateState(node.update_type, node.has_update);
-}
-
-function filterScanTreeNodes(
-  nodes: ScanTreeNode[],
-  keyword: string,
-): ScanTreeNode[] {
-  const normalizedKeyword = keyword.trim().toLowerCase();
-
-  const walk = (items: ScanTreeNode[]): ScanTreeNode[] =>
-    items
-      .map((node) => {
-        const children = node.children ? walk(node.children) : [];
-        const titleMatched =
-          !normalizedKeyword ||
-          node.title.toLowerCase().includes(normalizedKeyword) ||
-          node.key.toLowerCase().includes(normalizedKeyword);
-
-        if (node.is_dir) {
-          if (children.length > 0 || titleMatched) {
-            return {
-              ...node,
-              children: children.length > 0 ? children : undefined,
-            };
-          }
-          return null;
-        }
-
-        if (!titleMatched) {
-          return null;
-        }
-
-        return {
-          ...node,
-          children: undefined,
-        };
-      })
-      .filter(Boolean) as ScanTreeNode[];
-
-  return walk(nodes);
-}
-
 function collectScanTreeFileKeys(nodes: ScanTreeNode[]): string[] {
   const keys: string[] = [];
   const walk = (items: ScanTreeNode[]) => {
     items.forEach((node) => {
-      if (node.is_dir) {
-        if (node.children?.length) {
-          walk(node.children);
-        }
-        return;
+      if (node.children?.length) {
+        walk(node.children);
       }
       if (node.selectable === false) {
         return;
@@ -434,6 +373,10 @@ function collectScanTreeFileKeys(nodes: ScanTreeNode[]): string[] {
   };
   walk(nodes);
   return keys;
+}
+
+function getTreeNodeUpdateState(node: ScanTreeNode) {
+  return normalizeDataSourceFileUpdateState(node.update_type, node.has_update);
 }
 
 function shouldPollByParseStatus(items: DocumentStatusRow[]) {
@@ -510,6 +453,9 @@ export default function DataSourceDetail() {
   const [syncSelectedDocIds, setSyncSelectedDocIds] = useState<string[]>([]);
   const [syncPickerOpen, setSyncPickerOpen] = useState(false);
   const [syncTreeNodes, setSyncTreeNodes] = useState<ScanTreeNode[]>([]);
+  const [syncKnownSelectableFileKeys, setSyncKnownSelectableFileKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [syncTreeLoading, setSyncTreeLoading] = useState(false);
   const [syncSelectionToken, setSyncSelectionToken] = useState<string>("");
   const [syncSubmitting, setSyncSubmitting] = useState(false);
@@ -525,6 +471,8 @@ export default function DataSourceDetail() {
   } | null>(null);
   const syncPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const syncPollingActiveRef = useRef(false);
+  const syncTreeRequestSeqRef = useRef(0);
+  const syncTreeInitialLoadRef = useRef(false);
 
   const stopSyncPolling = useCallback(() => {
     syncPollingActiveRef.current = false;
@@ -541,9 +489,12 @@ export default function DataSourceDetail() {
     setSyncSelectedDocIds([]);
     setSyncPickerOpen(false);
     setSyncTreeNodes([]);
+    setSyncKnownSelectableFileKeys(new Set());
     setSyncTreeLoading(false);
     setSyncSelectionToken("");
     setSyncSubmitting(false);
+    syncTreeRequestSeqRef.current += 1;
+    syncTreeInitialLoadRef.current = false;
     setLastOperation(null);
   }, [id, routeSource?.id, routeSource?.lastSync, stopSyncPolling]);
 
@@ -671,7 +622,107 @@ export default function DataSourceDetail() {
 
   const sourceNameForPath = detailSource?.name || t("admin.dataSourceFallbackName");
 
-  const openSyncPicker = async () => {
+  const loadSyncTree = useCallback(
+    async (
+      keywordValue: string,
+      options: { selectAll?: boolean; closeOnError?: boolean } = {},
+    ) => {
+      if (!detailSource?.agentId) {
+        message.error("未获取到扫描 Agent 信息，无法加载目录树。");
+        if (options.closeOnError) {
+          setSyncPickerOpen(false);
+        }
+        return;
+      }
+
+      const treePath = detailSource.rootPath || detailSource.target;
+      if (!treePath) {
+        message.error("未获取到同步路径，无法加载目录树。");
+        if (options.closeOnError) {
+          setSyncPickerOpen(false);
+        }
+        return;
+      }
+
+      const requestSeq = syncTreeRequestSeqRef.current + 1;
+      syncTreeRequestSeqRef.current = requestSeq;
+      setSyncTreeLoading(true);
+
+      try {
+        const normalizedKeyword = keywordValue.trim();
+        const client = createScanApiClient();
+        const response = await client.apiScanAgentsFsTreePost({
+          agentPathTreeRequest: {
+            agent_id: detailSource.agentId,
+            source_id: detailSource.id,
+            path: treePath,
+            keyword: normalizedKeyword || undefined,
+            include_files: true,
+            changes_only: false,
+            updated_only: false,
+            max_depth: 8,
+          },
+        });
+
+        if (syncTreeRequestSeqRef.current !== requestSeq) {
+          return;
+        }
+
+        const nextTreeNodes = response.data.items || [];
+        const nextSelectionToken = response.data.selection_token || "";
+        const nextSelectableKeys = collectScanTreeFileKeys(nextTreeNodes);
+
+        setSyncTreeNodes(nextTreeNodes);
+        setSyncKnownSelectableFileKeys((prev) => {
+          const next = new Set(prev);
+          nextSelectableKeys.forEach((key) => next.add(key));
+          return next;
+        });
+        setSyncSelectionToken(nextSelectionToken);
+        setSyncSelectedDocIds((prev) =>
+          options.selectAll ? nextSelectableKeys : prev,
+        );
+      } catch (error) {
+        if (syncTreeRequestSeqRef.current !== requestSeq) {
+          return;
+        }
+        message.error(
+          getLocalizedErrorMessage(error, t("common.requestFailed")) ||
+            t("common.requestFailed"),
+        );
+        if (options.closeOnError) {
+          setSyncPickerOpen(false);
+        }
+      } finally {
+        if (syncTreeRequestSeqRef.current === requestSeq) {
+          setSyncTreeLoading(false);
+        }
+      }
+    },
+    [detailSource, t],
+  );
+
+  useEffect(() => {
+    if (!syncPickerOpen) {
+      return;
+    }
+
+    const timerId = window.setTimeout(() => {
+      const shouldSelectAll =
+        syncTreeInitialLoadRef.current && syncKeyword.trim() === "";
+      syncTreeInitialLoadRef.current = false;
+      void loadSyncTree(syncKeyword, {
+        selectAll: shouldSelectAll,
+        closeOnError: shouldSelectAll,
+      });
+    }, 300);
+
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [loadSyncTree, syncKeyword, syncPickerOpen]);
+
+  const openSyncPicker = () => {
     if (!detailSource?.agentId) {
       message.error("未获取到扫描 Agent 信息，无法加载目录树。");
       return;
@@ -685,39 +736,12 @@ export default function DataSourceDetail() {
 
     setSyncKeyword("");
     setSyncPickerOpen(true);
+    setSyncTreeNodes([]);
+    setSyncKnownSelectableFileKeys(new Set());
+    setSyncSelectionToken("");
     setSyncTreeLoading(true);
+    syncTreeInitialLoadRef.current = true;
     setSyncSelectedDocIds([]);
-
-    try {
-      const client = createScanApiClient();
-      const response = await client.apiScanAgentsFsTreePost({
-        agentPathTreeRequest: {
-          agent_id: detailSource.agentId,
-          source_id: detailSource.id,
-          path: treePath,
-          include_files: true,
-          changes_only: false,
-          updated_only: false,
-          max_depth: 8,
-        },
-      });
-
-      const nextTreeNodes = response.data.items || [];
-      const nextSelectionToken = response.data.selection_token || "";
-      const defaultSelected = collectScanTreeFileKeys(nextTreeNodes);
-
-      setSyncTreeNodes(nextTreeNodes);
-      setSyncSelectionToken(nextSelectionToken);
-      setSyncSelectedDocIds(defaultSelected);
-    } catch (error) {
-      message.error(
-        getLocalizedErrorMessage(error, t("common.requestFailed")) ||
-          t("common.requestFailed"),
-      );
-      setSyncPickerOpen(false);
-    } finally {
-      setSyncTreeLoading(false);
-    }
   };
 
   const runSyncPipeline = async (targetDocumentIds: string[]) => {
@@ -731,9 +755,10 @@ export default function DataSourceDetail() {
       return false;
     }
 
-    const selectableFileKeys = new Set(collectScanTreeFileKeys(syncTreeNodes));
     const targetPaths = targetDocumentIds.filter(
-      (id) => selectableFileKeys.size === 0 || selectableFileKeys.has(id),
+      (id) =>
+        syncKnownSelectableFileKeys.size === 0 ||
+        syncKnownSelectableFileKeys.has(id),
     );
     if (targetPaths.length === 0) {
       message.warning(t("admin.dataSourceDetailSelectFileFirst"));
@@ -775,10 +800,33 @@ export default function DataSourceDetail() {
         generateTasksRequest.selection_token = syncSelectionToken;
       }
 
-      const generateResponse = await client.apiScanSourcesIdTasksGeneratePost({
-        id: detailSource.id,
-        generateTasksRequest,
-      });
+      // If at least one selected target is a deleted-state synthetic node,
+      // attempting with a stale selection_token may be rejected by backend.
+      // Retry once without the token in that case.
+      const hasDeletedTarget = documents.some(
+        (item) =>
+          (targetSet.has(item.id) || targetSet.has(item.path)) &&
+          (item.sourceState === "DELETED" || item.updateState === "deleted"),
+      );
+
+      let generateResponse;
+      try {
+        generateResponse = await client.apiScanSourcesIdTasksGeneratePost({
+          id: detailSource.id,
+          generateTasksRequest,
+        });
+      } catch (err) {
+        if (hasDeletedTarget && generateTasksRequest.selection_token) {
+          const retryRequest = { ...generateTasksRequest };
+          delete retryRequest.selection_token;
+          generateResponse = await client.apiScanSourcesIdTasksGeneratePost({
+            id: detailSource.id,
+            generateTasksRequest: retryRequest,
+          });
+        } else {
+          throw err;
+        }
+      }
       const result = generateResponse.data;
       const checkedCount = result.requested_count ?? targetPaths.length;
       const syncedCount = result.accepted_count ?? 0;
@@ -888,30 +936,30 @@ export default function DataSourceDetail() {
     }
   };
 
-  const filteredSyncTreeNodes = useMemo(
-    () => filterScanTreeNodes(syncTreeNodes, syncKeyword),
-    [syncTreeNodes, syncKeyword],
-  );
-
   const syncTreeData = useMemo<DataNode[]>(() => {
     const toDataNode = (nodes: ScanTreeNode[]): DataNode[] =>
       nodes.map((node) => {
         const children = node.children ? toDataNode(node.children) : undefined;
-        const updated = isTreeNodeUpdated(node);
+        const updateState = getTreeNodeUpdateState(node);
+        const updateMeta = getFileUpdateMeta(updateState, t);
+        const updateText = `${node.update_desc || ""}`.trim() || updateMeta.text;
+        const hasUpdateStatus =
+          typeof node.has_update === "boolean" || Boolean(node.update_type || node.update_desc);
 
         return {
           key: node.key,
           isLeaf: !node.is_dir,
           disableCheckbox: !node.is_dir && node.selectable === false,
-          title: node.is_dir ? (
-            <span>{node.title}</span>
-          ) : (
+          title: (
             <div className="data-source-sync-tree-file">
               <div className="data-source-sync-tree-file-main">
                 <span>{node.title}</span>
-                {updated ? (
-                  <span className="data-source-sync-tree-chip data-source-sync-tree-chip-changed">
-                    {t("admin.dataSourceFileUpdateChanged")}
+                {hasUpdateStatus ? (
+                  <span
+                    className={`data-source-sync-tree-chip data-source-sync-tree-chip-${updateState}`}
+                    title={updateText}
+                  >
+                    {updateText}
                   </span>
                 ) : null}
               </div>
@@ -921,17 +969,17 @@ export default function DataSourceDetail() {
         };
       });
 
-    return toDataNode(filteredSyncTreeNodes);
-  }, [filteredSyncTreeNodes, t]);
+    return toDataNode(syncTreeNodes);
+  }, [syncTreeNodes, t]);
 
   const checkedTreeKeys = syncSelectedDocIds;
   const filteredSyncNodeKeys = useMemo(
-    () => collectScanTreeFileKeys(filteredSyncTreeNodes),
-    [filteredSyncTreeNodes],
+    () => collectScanTreeFileKeys(syncTreeNodes),
+    [syncTreeNodes],
   );
   const selectableSyncFileKeys = useMemo(
-    () => new Set(collectScanTreeFileKeys(syncTreeNodes)),
-    [syncTreeNodes],
+    () => syncKnownSelectableFileKeys,
+    [syncKnownSelectableFileKeys],
   );
   const hasFilteredSelected = filteredSyncNodeKeys.some((id) =>
     syncSelectedDocIds.includes(id),
@@ -980,16 +1028,55 @@ export default function DataSourceDetail() {
       title: t("admin.dataSourceDetailTableUpdateState"),
       dataIndex: "updateState",
       key: "updateState",
-      width: 220,
-      render: (updateState: DocumentStatusRow["updateState"]) => {
-        const meta = getUpdateStateMeta(updateState, t);
+      width: 240,
+      render: (_value, record) => {
+        const sourceState: SourceStateValue =
+          record.sourceState ||
+          (() => {
+            if (record.updateState === "new") return "NEW";
+            if (record.updateState === "changed") return "MODIFIED";
+            if (record.updateState === "deleted") return "DELETED";
+            return "UNCHANGED";
+          })();
+        const syncState: SyncStateValue = record.syncState || "IDLE";
+        const sourceMeta = getSourceStateMeta(sourceState, t);
+        const syncMeta = getSyncStateMeta(
+          syncState,
+          {
+            nextSyncAt: record.nextSyncAt,
+            lastError: record.lastError,
+            knowledgeBasePresent: record.knowledgeBasePresent,
+            sourceState,
+          },
+          t,
+        );
+        const detail = buildDocumentStatusDetail(
+          {
+            source_state: sourceState,
+            sync_state: syncState,
+            next_sync_at: record.nextSyncAt,
+            last_error: record.lastError,
+            knowledge_base_present: record.knowledgeBasePresent,
+            update_type: record.updateState.toUpperCase(),
+            has_update: record.updateState !== "unchanged",
+          },
+          t,
+        );
+        const shouldShowSyncState = syncState !== "IDLE";
         return (
           <div className="data-source-detail-update-state">
-            <span className={`data-source-update-chip data-source-update-chip-${meta.tone}`}>
+            <span className={`data-source-update-chip data-source-update-chip-${sourceMeta.tone}`}>
               <span className="data-source-update-chip-dot" />
-              {meta.text}
+              {sourceMeta.text}
             </span>
-            <Text type="secondary">{meta.detail}</Text>
+            {shouldShowSyncState ? (
+              <Tag color={syncMeta.color} style={{ marginInlineEnd: 0 }}>
+                {syncMeta.text}
+              </Tag>
+            ) : null}
+            <Text type="secondary" title={detail}>
+              {detail}
+            </Text>
           </div>
         );
       },
@@ -1038,12 +1125,6 @@ export default function DataSourceDetail() {
       ),
     },
     {
-      title: t("admin.dataSourceDetailTableSourceUpdatedAt"),
-      dataIndex: "sourceUpdatedAt",
-      key: "sourceUpdatedAt",
-      width: 180,
-    },
-    {
       title: t("admin.dataSourceDetailTableUpdatedAt"),
       dataIndex: "updatedAt",
       key: "updatedAt",
@@ -1084,6 +1165,8 @@ export default function DataSourceDetail() {
           selectableSyncFileKeys={selectableSyncFileKeys}
           onCancel={() => {
             if (!syncSubmitting) {
+              syncTreeRequestSeqRef.current += 1;
+              syncTreeInitialLoadRef.current = false;
               setSyncPickerOpen(false);
             }
           }}

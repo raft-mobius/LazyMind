@@ -23,13 +23,13 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"github.com/lazyrag/scan_control_plane/internal/cloudsync/authclient"
-	cloudprovider "github.com/lazyrag/scan_control_plane/internal/cloudsync/provider"
-	"github.com/lazyrag/scan_control_plane/internal/cloudsync/provider/feishu"
-	"github.com/lazyrag/scan_control_plane/internal/coreclient"
-	"github.com/lazyrag/scan_control_plane/internal/model"
-	"github.com/lazyrag/scan_control_plane/internal/sourcelayout"
-	"github.com/lazyrag/scan_control_plane/internal/store"
+	"github.com/lazymind/scan_control_plane/internal/cloudsync/authclient"
+	cloudprovider "github.com/lazymind/scan_control_plane/internal/cloudsync/provider"
+	"github.com/lazymind/scan_control_plane/internal/cloudsync/provider/feishu"
+	"github.com/lazymind/scan_control_plane/internal/coreclient"
+	"github.com/lazymind/scan_control_plane/internal/model"
+	"github.com/lazymind/scan_control_plane/internal/sourcelayout"
+	"github.com/lazymind/scan_control_plane/internal/store"
 )
 
 const (
@@ -41,6 +41,8 @@ const (
 	openAPIJSONPath     = "/openapi.json"
 	openAPIYAMLPath     = "/openapi.yaml"
 	swaggerJSONPath     = "/swagger.json"
+
+	cloudBindingValidationCleanupWindow = 10 * time.Minute
 )
 
 type Handler struct {
@@ -50,7 +52,7 @@ type Handler struct {
 	coreDatasetID  string
 	agentToken     string
 	cloudSyncTrig  func(sourceID, runID string) bool
-	cloudAuth      *authclient.Client
+	cloudAuth      cloudTokenClient
 	cloudProviders map[string]cloudprovider.Provider
 	client         *http.Client
 	log            *zap.Logger
@@ -58,6 +60,18 @@ type Handler struct {
 
 type EventMerger interface {
 	Ingest(events []model.FileEvent)
+}
+
+type cloudTokenClient interface {
+	GetAccessToken(ctx context.Context, connectionID string) (authclient.TokenResponse, error)
+}
+
+type cloudTargetValidationRequest struct {
+	Provider         string
+	AuthConnectionID string
+	TargetType       string
+	TargetRef        string
+	ProviderOptions  map[string]any
 }
 
 func NewHandler(
@@ -227,6 +241,7 @@ func (h *Handler) registerFrontendRoutes(mux *http.ServeMux, prefix string) {
 	}
 	mux.HandleFunc("POST "+prefix+"/sources", h.createSource)
 	mux.HandleFunc("POST "+prefix+"/knowledge-bases", h.createKnowledgeBase)
+	mux.HandleFunc("POST "+prefix+"/cloud/target/validate", h.validateCloudTarget)
 	mux.HandleFunc("GET "+prefix+"/sources", h.listSources)
 	mux.HandleFunc("GET "+prefix+"/sources/{id}", h.getSource)
 	mux.HandleFunc("PUT "+prefix+"/sources/{id}", h.updateSource)
@@ -263,6 +278,11 @@ func (h *Handler) createSource(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	req.CreateUserID = strings.TrimSpace(r.Header.Get("X-User-Id"))
+	if req.CreateUserID == "" {
+		writeError(w, http.StatusBadRequest, "MISSING_CURRENT_USER", "missing X-User-Id")
+		return
+	}
 	req.DatasetID = strings.TrimSpace(req.DatasetID)
 	if h.core != nil && h.core.Enabled() {
 		// In core-task mode each source should have a concrete dataset binding.
@@ -276,6 +296,10 @@ func (h *Handler) createSource(w http.ResponseWriter, r *http.Request) {
 	}
 	src, err := h.store.CreateSource(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, store.ErrSourceAlreadyExists) {
+			writeError(w, http.StatusConflict, "SOURCE_ALREADY_EXISTS", err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, "CREATE_SOURCE_FAILED", err.Error())
 		return
 	}
@@ -315,6 +339,22 @@ func (h *Handler) createKnowledgeBase(w http.ResponseWriter, r *http.Request) {
 		CurrentUserName: currentUserName,
 	})
 	if err != nil {
+		if coreclient.IsConflictError(err) {
+			result, ok, reuseErr := h.reuseUnboundScanKnowledgeBase(r.Context(), strings.TrimSpace(req.Name), currentUserID, currentUserName)
+			if reuseErr != nil {
+				writeError(w, http.StatusInternalServerError, "REUSE_KNOWLEDGE_BASE_FAILED", reuseErr.Error())
+				return
+			}
+			if ok {
+				writeJSON(w, http.StatusOK, model.CreateKnowledgeBaseResponse{
+					DatasetID: result.DatasetID,
+					Name:      result.Name,
+				})
+				return
+			}
+			writeError(w, http.StatusConflict, "KNOWLEDGE_BASE_ALREADY_EXISTS", "knowledge base already exists")
+			return
+		}
 		writeError(w, http.StatusBadGateway, "CREATE_KNOWLEDGE_BASE_FAILED", err.Error())
 		return
 	}
@@ -324,16 +364,75 @@ func (h *Handler) createKnowledgeBase(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) reuseUnboundScanKnowledgeBase(ctx context.Context, name, userID, userName string) (coreclient.CreateKnowledgeBaseResult, bool, error) {
+	if h.core == nil || h.store == nil {
+		return coreclient.CreateKnowledgeBaseResult{}, false, nil
+	}
+	kb, found, err := h.core.FindKnowledgeBaseByName(ctx, name, userID, userName)
+	if err != nil {
+		return coreclient.CreateKnowledgeBaseResult{}, false, err
+	}
+	if !found || !kb.ScanManaged || strings.TrimSpace(kb.DatasetID) == "" {
+		return coreclient.CreateKnowledgeBaseResult{}, false, nil
+	}
+	bound, err := h.store.SourceExistsByDatasetID(ctx, kb.DatasetID)
+	if err != nil {
+		return coreclient.CreateKnowledgeBaseResult{}, false, err
+	}
+	if bound {
+		return coreclient.CreateKnowledgeBaseResult{}, false, nil
+	}
+	resultName := strings.TrimSpace(kb.Name)
+	if resultName == "" {
+		resultName = strings.TrimSpace(name)
+	}
+	return coreclient.CreateKnowledgeBaseResult{
+		DatasetID: strings.TrimSpace(kb.DatasetID),
+		Name:      resultName,
+	}, true, nil
+}
+
 func (h *Handler) listSources(w http.ResponseWriter, r *http.Request) {
 	tenantID := strings.TrimSpace(r.URL.Query().Get("tenant_id"))
-	sources, err := h.store.ListSources(r.Context(), tenantID)
+	currentUserID := strings.TrimSpace(r.Header.Get("X-User-Id"))
+	if currentUserID == "" {
+		writeError(w, http.StatusBadRequest, "MISSING_CURRENT_USER", "missing X-User-Id")
+		return
+	}
+	sources, err := h.store.ListSources(r.Context(), tenantID, currentUserID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "LIST_SOURCES_FAILED", err.Error())
 		return
 	}
+
+	sourceIDs := make([]string, 0, len(sources))
+	for _, src := range sources {
+		sourceIDs = append(sourceIDs, src.ID)
+	}
+	bindings, err := h.store.ListCloudSourceBindingsBySourceIDs(r.Context(), sourceIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "LIST_SOURCE_BINDINGS_FAILED", err.Error())
+		return
+	}
+	documentOverviews, err := h.store.ListSourceDocumentOverviews(r.Context(), sources)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "LIST_SOURCE_DOCUMENTS_FAILED", err.Error())
+		return
+	}
+
 	items := make([]model.Source, 0, len(sources))
 	for _, src := range sources {
-		items = append(items, publicSourceModel(src))
+		item := publicSourceModel(src)
+		if binding, ok := bindings[src.ID]; ok {
+			binding := binding
+			item.CloudBinding = &binding
+		}
+		if docs, ok := documentOverviews[src.ID]; ok {
+			docs := docs
+			docs.Source.RootPath = item.RootPath
+			item.Documents = &docs
+		}
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
@@ -364,6 +463,10 @@ func (h *Handler) updateSource(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "SOURCE_NOT_FOUND", "source not found")
 			return
 		}
+		if errors.Is(err, store.ErrSourceAlreadyExists) {
+			writeError(w, http.StatusConflict, "SOURCE_ALREADY_EXISTS", err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, "UPDATE_SOURCE_FAILED", err.Error())
 		return
 	}
@@ -372,6 +475,34 @@ func (h *Handler) updateSource(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteSource(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "DELETE_SOURCE_FAILED", "source_id is required")
+		return
+	}
+	src, err := h.store.GetSource(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "SOURCE_NOT_FOUND", "source not found")
+			return
+		}
+		if isBadRequestError(err) {
+			writeError(w, http.StatusBadRequest, "DELETE_SOURCE_FAILED", err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "DELETE_SOURCE_FAILED", err.Error())
+		return
+	}
+	if h.core != nil && h.core.Enabled() {
+		datasetID := strings.TrimSpace(src.DatasetID)
+		if datasetID != "" {
+			userID := firstNonEmptyString(src.CreateUserID, r.Header.Get("X-User-Id"))
+			userName := strings.TrimSpace(r.Header.Get("X-User-Name"))
+			if err := h.core.DeleteDataset(r.Context(), datasetID, userID, userName); err != nil {
+				writeError(w, http.StatusBadGateway, "DELETE_BOUND_KNOWLEDGE_BASE_FAILED", err.Error())
+				return
+			}
+		}
+	}
 	if err := h.store.DeleteSource(r.Context(), id); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			writeError(w, http.StatusNotFound, "SOURCE_NOT_FOUND", "source not found")
@@ -412,10 +543,47 @@ func (h *Handler) setSourceEnabled(w http.ResponseWriter, r *http.Request, enabl
 	writeJSON(w, http.StatusOK, publicSourceModel(src))
 }
 
+func (h *Handler) validateCloudTarget(w http.ResponseWriter, r *http.Request) {
+	var req model.ValidateCloudTargetRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := h.validateCloudTargetConfig(r.Context(), cloudTargetValidationRequest{
+		Provider:         req.Provider,
+		AuthConnectionID: req.AuthConnectionID,
+		TargetType:       req.TargetType,
+		TargetRef:        req.TargetRef,
+		ProviderOptions:  req.ProviderOptions,
+	}); err != nil {
+		writeError(w, http.StatusBadRequest, "CLOUD_TARGET_INVALID", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, model.ValidateCloudTargetResponse{Valid: true})
+}
+
 func (h *Handler) upsertCloudBinding(w http.ResponseWriter, r *http.Request) {
 	sourceID := strings.TrimSpace(r.PathValue("id"))
 	var req model.UpsertCloudSourceBindingRequest
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	src, err := h.store.GetSource(r.Context(), sourceID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "SOURCE_NOT_FOUND", "source not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "GET_SOURCE_FAILED", err.Error())
+		return
+	}
+	hadExistingBinding, err := h.validateCloudBindingTarget(r.Context(), sourceID, req)
+	if err != nil {
+		cleanupErr := h.cleanupNewCloudSourceAfterTargetValidationFailure(r.Context(), r, src, hadExistingBinding)
+		msg := err.Error()
+		if cleanupErr != nil {
+			msg = fmt.Sprintf("%s; cleanup failed: %v", msg, cleanupErr)
+		}
+		writeError(w, http.StatusBadRequest, "CLOUD_TARGET_INVALID", msg)
 		return
 	}
 	binding, err := h.store.UpsertCloudSourceBinding(r.Context(), sourceID, req)
@@ -928,8 +1096,12 @@ func (h *Handler) reportScanResults(w http.ResponseWriter, r *http.Request) {
 	)
 	events := make([]model.FileEvent, 0, len(req.Records))
 	for _, rec := range req.Records {
+		sourceID := strings.TrimSpace(rec.SourceID)
+		if sourceID == "" {
+			sourceID = strings.TrimSpace(req.SourceID)
+		}
 		events = append(events, model.FileEvent{
-			SourceID:       rec.SourceID,
+			SourceID:       sourceID,
 			EventType:      "modified",
 			Path:           rec.Path,
 			IsDir:          rec.IsDir,
@@ -941,6 +1113,10 @@ func (h *Handler) reportScanResults(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	if h.merger != nil {
+		if err := h.store.PersistScanResultSnapshotMetadata(r.Context(), req); err != nil {
+			writeError(w, http.StatusInternalServerError, "INGEST_SCAN_RESULT_METADATA_FAILED", err.Error())
+			return
+		}
 		h.merger.Ingest(events)
 	} else {
 		if err := h.store.IngestScanResults(r.Context(), req); err != nil {
@@ -1071,6 +1247,7 @@ func (h *Handler) pathTreeByAgent(w http.ResponseWriter, r *http.Request) {
 			var treeResp model.AgentPathTreeResponse
 			payload := map[string]any{
 				"path":          treePath,
+				"keyword":       "",
 				"max_depth":     req.MaxDepth,
 				"include_files": req.IncludeFiles,
 			}
@@ -1078,14 +1255,13 @@ func (h *Handler) pathTreeByAgent(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadGateway, "AGENT_TREE_FAILED", err.Error())
 				return
 			}
-			fileStats, err = h.fetchTreeFileStats(r.Context(), agent.ListenAddr, treeResp.Items)
+			treeItems = treeResp.Items
+			fileStats, err = h.fetchTreeFileStats(r.Context(), agent.ListenAddr, treeItems)
 			if err != nil {
 				writeError(w, http.StatusBadGateway, "AGENT_TREE_STAT_FAILED", err.Error())
 				return
 			}
-			treeItems = treeResp.Items
 		}
-
 		items, token, err := h.store.BuildTreeUpdateState(r.Context(), sourceID, treeItems, fileStats)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1101,6 +1277,7 @@ func (h *Handler) pathTreeByAgent(w http.ResponseWriter, r *http.Request) {
 		if req.ChangesOnly || req.UpdatedOnly {
 			items = filterTreeToChanged(items)
 		}
+		items = filterTreeByKeyword(items, req.Keyword)
 		items = normalizeTreeParseQueueStatesForResponse(items)
 		writeJSON(w, http.StatusOK, model.AgentPathTreeResponse{
 			Items:          items,
@@ -1122,6 +1299,7 @@ func (h *Handler) pathTreeByAgent(w http.ResponseWriter, r *http.Request) {
 	var treeResp model.AgentPathTreeResponse
 	payload := map[string]any{
 		"path":          req.Path,
+		"keyword":       req.Keyword,
 		"max_depth":     req.MaxDepth,
 		"include_files": req.IncludeFiles,
 	}
@@ -1129,6 +1307,7 @@ func (h *Handler) pathTreeByAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "AGENT_TREE_FAILED", err.Error())
 		return
 	}
+	treeResp.Items = filterTreeByKeyword(treeResp.Items, req.Keyword)
 	writeJSON(w, http.StatusOK, treeResp)
 }
 
@@ -1248,6 +1427,159 @@ func isBadRequestError(err error) bool {
 		strings.Contains(msg, "does not support retry")
 }
 
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func (h *Handler) validateCloudBindingTarget(ctx context.Context, sourceID string, req model.UpsertCloudSourceBindingRequest) (bool, error) {
+	targetReq := cloudTargetValidationRequest{
+		Provider:         req.Provider,
+		AuthConnectionID: req.AuthConnectionID,
+		TargetType:       req.TargetType,
+		TargetRef:        req.TargetRef,
+		ProviderOptions:  req.ProviderOptions,
+	}
+	hadExistingBinding := false
+	existing, err := h.store.GetCloudSourceBinding(ctx, sourceID)
+	if err == nil {
+		hadExistingBinding = true
+		if strings.TrimSpace(targetReq.Provider) == "" {
+			targetReq.Provider = existing.Provider
+		}
+		if strings.TrimSpace(targetReq.AuthConnectionID) == "" {
+			targetReq.AuthConnectionID = existing.AuthConnectionID
+		}
+		if strings.TrimSpace(targetReq.TargetType) == "" {
+			targetReq.TargetType = existing.TargetType
+		}
+		if strings.TrimSpace(targetReq.TargetRef) == "" {
+			targetReq.TargetRef = existing.TargetRef
+		}
+		if targetReq.ProviderOptions == nil {
+			targetReq.ProviderOptions = existing.ProviderOptions
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, fmt.Errorf("load existing cloud binding failed: %w", err)
+	}
+	return hadExistingBinding, h.validateCloudTargetConfig(ctx, targetReq)
+}
+
+func (h *Handler) validateCloudTargetConfig(ctx context.Context, req cloudTargetValidationRequest) error {
+	providerName := strings.ToLower(strings.TrimSpace(req.Provider))
+	if providerName == "" {
+		return fmt.Errorf("provider is required")
+	}
+	authConnectionID := strings.TrimSpace(req.AuthConnectionID)
+	if authConnectionID == "" {
+		return fmt.Errorf("auth_connection_id is required")
+	}
+	if h.cloudAuth == nil {
+		return fmt.Errorf("cloud auth client is not configured")
+	}
+	impl := h.cloudProviders[providerName]
+	if impl == nil {
+		return fmt.Errorf("unsupported cloud provider: %s", providerName)
+	}
+
+	tokenResp, err := h.cloudAuth.GetAccessToken(ctx, authConnectionID)
+	if err != nil {
+		return fmt.Errorf("acquire cloud access token failed: %w", err)
+	}
+	accessToken := strings.TrimSpace(tokenResp.AccessToken)
+	if accessToken == "" {
+		return fmt.Errorf("auth token response missing access_token")
+	}
+
+	validateReq := cloudprovider.ListRequest{
+		AccessToken:     accessToken,
+		TargetType:      req.TargetType,
+		TargetRef:       req.TargetRef,
+		ProviderOptions: req.ProviderOptions,
+	}
+	if validator, ok := impl.(cloudprovider.TargetValidator); ok {
+		if err := validator.ValidateTarget(ctx, validateReq); err != nil {
+			return fmt.Errorf("%s target validation failed: %w", providerName, err)
+		}
+	} else if _, err := impl.ListObjects(ctx, validateReq); err != nil {
+		return fmt.Errorf("%s target validation failed: %w", providerName, err)
+	}
+	if h.log != nil {
+		h.log.Info("cloud target validated",
+			zap.String("provider", providerName),
+			zap.String("auth_connection_id", authConnectionID),
+			zap.String("target_type", strings.TrimSpace(req.TargetType)),
+			zap.String("target_ref", strings.TrimSpace(req.TargetRef)),
+		)
+	}
+	return nil
+}
+
+func (h *Handler) cleanupNewCloudSourceAfterTargetValidationFailure(
+	ctx context.Context,
+	r *http.Request,
+	src model.Source,
+	hadExistingBinding bool,
+) error {
+	if !shouldCleanupNewCloudSourceAfterTargetValidationFailure(src, hadExistingBinding, time.Now().UTC(), strings.TrimSpace(r.Header.Get("X-User-Id"))) {
+		return nil
+	}
+
+	var cleanupErrs []string
+	datasetID := strings.TrimSpace(src.DatasetID)
+	if h.core != nil && h.core.Enabled() && datasetID != "" {
+		userID := firstNonEmptyString(src.CreateUserID, r.Header.Get("X-User-Id"))
+		userName := strings.TrimSpace(r.Header.Get("X-User-Name"))
+		if err := h.core.DeleteDataset(ctx, datasetID, userID, userName); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Sprintf("delete dataset %s: %v", datasetID, err))
+		}
+	}
+	if err := h.store.DeleteSource(ctx, src.ID); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Sprintf("delete source %s: %v", src.ID, err))
+	}
+	if len(cleanupErrs) > 0 {
+		if h.log != nil {
+			h.log.Warn("cleanup newly-created cloud source after target validation failure failed",
+				zap.String("source_id", strings.TrimSpace(src.ID)),
+				zap.String("dataset_id", datasetID),
+				zap.Strings("errors", cleanupErrs),
+			)
+		}
+		return errors.New(strings.Join(cleanupErrs, "; "))
+	}
+	if h.log != nil {
+		h.log.Info("cleaned newly-created cloud source after target validation failure",
+			zap.String("source_id", strings.TrimSpace(src.ID)),
+			zap.String("dataset_id", datasetID),
+		)
+	}
+	return nil
+}
+
+func shouldCleanupNewCloudSourceAfterTargetValidationFailure(src model.Source, hadExistingBinding bool, now time.Time, currentUserID string) bool {
+	if hadExistingBinding {
+		return false
+	}
+	if strings.TrimSpace(src.ID) == "" {
+		return false
+	}
+	if !sourcelayout.IsCloudOriginType(src.DefaultOriginType) && !strings.EqualFold(strings.TrimSpace(src.SourceType), "cloud_sync") {
+		return false
+	}
+	if strings.TrimSpace(src.CreateUserID) != "" && strings.TrimSpace(currentUserID) != "" && strings.TrimSpace(src.CreateUserID) != strings.TrimSpace(currentUserID) {
+		return false
+	}
+	if src.CreatedAt.IsZero() {
+		return false
+	}
+	age := now.Sub(src.CreatedAt.UTC())
+	return age >= 0 && age <= cloudBindingValidationCleanupWindow
+}
+
 func pathInSourceRoot(path, root string) bool {
 	path = filepath.Clean(strings.TrimSpace(path))
 	root = filepath.Clean(strings.TrimSpace(root))
@@ -1347,6 +1679,13 @@ func (h *Handler) buildCloudTreeBySourceLive(
 			pathOwner[rel] = id
 		}
 	}
+	remoteParentIDs := make(map[string]struct{}, len(objects))
+	for _, obj := range objects {
+		parentID := strings.TrimSpace(obj.ExternalParentID)
+		if parentID != "" {
+			remoteParentIDs[parentID] = struct{}{}
+		}
+	}
 
 	rootPath := filepath.Clean(sourcelayout.CloudMirrorRoot(src.RootPath))
 	if h.log != nil {
@@ -1360,6 +1699,9 @@ func (h *Handler) buildCloudTreeBySourceLive(
 	nodeMap := make(map[string]*model.TreeNode, len(objects))
 	childMap := make(map[string]map[string]struct{}, len(objects))
 	fileStats := make(map[string]model.TreeFileStat, len(objects))
+	now := time.Now().UTC()
+	seenIndexIDs := make(map[string]struct{}, len(objects))
+	indexUpserts := make([]store.CloudObjectIndexRecord, 0, len(objects))
 	hasScopedObject := false
 	pathIsFile := false
 	filteredByPattern := 0
@@ -1378,6 +1720,10 @@ func (h *Handler) buildCloudTreeBySourceLive(
 	decisionSamples := make([]string, 0, 12)
 
 	for _, obj := range objects {
+		objectID := strings.TrimSpace(obj.ExternalObjectID)
+		if objectID != "" {
+			seenIndexIDs[objectID] = struct{}{}
+		}
 		decision := cloudIncludeObjectDecision(obj, binding.IncludePatterns, binding.ExcludePatterns)
 		decisionSamples = appendCloudFilterDecisionSample(decisionSamples, obj, decision, 12)
 		if !decision.Include {
@@ -1400,13 +1746,15 @@ func (h *Handler) buildCloudTreeBySourceLive(
 		default:
 			keptByNoIncludeRules++
 		}
-		objectID := strings.TrimSpace(obj.ExternalObjectID)
 		if objectID == "" {
 			continue
 		}
-		kind := cloudNormalizeKind(obj.ExternalKind, obj.ProviderMeta)
+		_, hasRemoteChild := remoteParentIDs[objectID]
+		kind, providerMeta := cloudObjectKindAndMeta(obj, existingByID, hasRemoteChild)
 		isDir := cloudIsDirKind(kind)
-		objectPath, relPath := cloudResolveObjectPath(rootPath, obj, kind, existingByID, pathOwner)
+		pathObject := obj
+		pathObject.ProviderMeta = providerMeta
+		objectPath, relPath := cloudResolveObjectPath(rootPath, pathObject, kind, existingByID, pathOwner)
 		if objectPath == "" {
 			continue
 		}
@@ -1417,27 +1765,66 @@ func (h *Handler) buildCloudTreeBySourceLive(
 			filteredByRootScope++
 			continue
 		}
-
-		if objectPath == treePath {
-			hasScopedObject = true
-			if !isDir {
-				pathIsFile = true
-			} else {
-				cloudEnsureNode(nodeMap, childMap, objectPath, true, strings.TrimSpace(obj.ExternalName), "")
+		externalVersion := strings.TrimSpace(obj.ExternalVersion)
+		sizeBytes := obj.SizeBytes
+		checksum := externalVersion
+		if existing, ok := existingByID[objectID]; ok {
+			if externalVersion == "" {
+				externalVersion = strings.TrimSpace(existing.ExternalVersion)
+			}
+			if strings.TrimSpace(existing.Checksum) != "" {
+				checksum = strings.TrimSpace(existing.Checksum)
+			}
+			if sizeBytes <= 0 {
+				sizeBytes = existing.SizeBytes
 			}
 		}
-		if !pathInSourceRoot(objectPath, treePath) {
+		indexUpserts = append(indexUpserts, store.CloudObjectIndexRecord{
+			SourceID:           sourceID,
+			Provider:           providerName,
+			ExternalObjectID:   objectID,
+			ExternalParentID:   strings.TrimSpace(obj.ExternalParentID),
+			ExternalPath:       strings.TrimSpace(obj.ExternalPath),
+			ExternalName:       strings.TrimSpace(obj.ExternalName),
+			ExternalKind:       kind,
+			ExternalVersion:    externalVersion,
+			ExternalModifiedAt: obj.ExternalModifiedAt,
+			LocalRelPath:       strings.TrimSpace(relPath),
+			LocalAbsPath:       objectPath,
+			Checksum:           checksum,
+			SizeBytes:          sizeBytes,
+			IsDeleted:          false,
+			LastSyncedAt:       &now,
+			ProviderMeta:       providerMeta,
+		})
+
+		treeObjectPath := cloudObjectTreePath(objectPath, kind, providerMeta)
+		if treeObjectPath == "" || treeObjectPath == "." || !pathInSourceRoot(treeObjectPath, rootPath) {
+			filteredByRootScope++
+			continue
+		}
+
+		treeIsDir := isDir && !cloudWikiPageShouldFold(objectPath, kind, providerMeta)
+		if treeObjectPath == treePath {
+			hasScopedObject = true
+			if !isDir && treeObjectPath == objectPath {
+				pathIsFile = true
+			} else if treeIsDir {
+				cloudEnsureNode(nodeMap, childMap, treeObjectPath, true, cloudObjectDisplayTitle(treeObjectPath, obj, true), "")
+			}
+		}
+		if !pathInSourceRoot(treeObjectPath, treePath) {
 			filteredByTreeScope++
 			continue
 		}
 		hasScopedObject = true
 
-		depth := cloudTreeRelativeDepth(treePath, objectPath)
+		depth := cloudTreeRelativeDepth(treePath, treeObjectPath)
 		if depth < 0 {
 			continue
 		}
 		if depth > 0 {
-			cloudEnsureAncestorNodes(nodeMap, childMap, treePath, objectPath, maxDepth)
+			cloudEnsureAncestorNodes(nodeMap, childMap, treePath, treeObjectPath, maxDepth)
 		}
 		if depth == 0 {
 			continue
@@ -1455,7 +1842,7 @@ func (h *Handler) buildCloudTreeBySourceLive(
 		if !isDir {
 			externalFileID = objectID
 			stat := model.TreeFileStat{
-				Path:     objectPath,
+				Path:     treeObjectPath,
 				IsDir:    false,
 				Size:     obj.SizeBytes,
 				Checksum: strings.TrimSpace(obj.ExternalVersion),
@@ -1476,9 +1863,17 @@ func (h *Handler) buildCloudTreeBySourceLive(
 				mt := obj.ExternalModifiedAt.UTC()
 				stat.ModTime = &mt
 			}
-			fileStats[objectPath] = stat
+			fileStats[treeObjectPath] = stat
 		}
-		cloudEnsureNode(nodeMap, childMap, objectPath, isDir, strings.TrimSpace(obj.ExternalName), externalFileID)
+		parentTreePath := ""
+		if parentID := strings.TrimSpace(obj.ExternalParentID); parentID != "" {
+			parentTreePath = strings.TrimSpace(cloudTreePathByObjectID(rootPath, parentID, objects, existingByID, pathOwner))
+		}
+		if treeObjectPath == objectPath {
+			cloudEnsureNodeWithParent(nodeMap, childMap, treeObjectPath, parentTreePath, treeIsDir, cloudObjectDisplayTitle(treeObjectPath, obj, treeIsDir), externalFileID)
+		} else {
+			cloudEnsureNodeWithParent(nodeMap, childMap, treeObjectPath, parentTreePath, false, cloudObjectDisplayTitle(treeObjectPath, obj, false), externalFileID)
+		}
 		addedNodeCount++
 	}
 
@@ -1513,6 +1908,27 @@ func (h *Handler) buildCloudTreeBySourceLive(
 				zap.Strings("sample_filtered_by_pattern", filteredPatternSamples),
 				zap.Strings("sample_passed_pattern", passedPatternSamples),
 			)
+		}
+	}
+	if len(indexUpserts) > 0 {
+		if err := h.store.UpsertCloudObjectIndexBatch(ctx, sourceID, providerName, indexUpserts, now); err != nil {
+			return nil, nil, fmt.Errorf("refresh cloud object index failed: %w", err)
+		}
+	}
+	missingIndexIDs := make([]string, 0)
+	for _, row := range indexRows {
+		id := strings.TrimSpace(row.ExternalObjectID)
+		if id == "" || row.IsDeleted {
+			continue
+		}
+		if _, ok := seenIndexIDs[id]; ok {
+			continue
+		}
+		missingIndexIDs = append(missingIndexIDs, id)
+	}
+	if len(missingIndexIDs) > 0 {
+		if err := h.store.MarkCloudObjectsDeleted(ctx, sourceID, missingIndexIDs, now); err != nil {
+			return nil, nil, fmt.Errorf("refresh cloud object deleted marks failed: %w", err)
 		}
 	}
 
@@ -1695,6 +2111,99 @@ func cloudKindMatchSuffixes(kind string) []string {
 	}
 }
 
+func cloudWikiPageWithChildren(kind string, meta map[string]any) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "doc", "docx":
+	default:
+		return false
+	}
+	return cloudBoolOption(meta, "has_child")
+}
+
+func cloudWikiPageObject(kind string, meta map[string]any) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "doc", "docx":
+	default:
+		return false
+	}
+	if cloudWikiPageWithChildren(kind, meta) {
+		return true
+	}
+	for _, key := range []string{"node_token", "space_id", "obj_token", "obj_type", "wiki_token"} {
+		if raw, ok := meta[key]; ok && raw != nil && strings.TrimSpace(fmt.Sprintf("%v", raw)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func cloudObjectKindAndMeta(obj cloudprovider.RemoteObject, existingByID map[string]store.CloudObjectIndexRecord, hasRemoteChild bool) (string, map[string]any) {
+	kind := cloudNormalizeKind(obj.ExternalKind, obj.ProviderMeta)
+	meta := copyCloudProviderMeta(nil)
+	if existingByID != nil {
+		if existing, ok := existingByID[strings.TrimSpace(obj.ExternalObjectID)]; ok {
+			if strings.TrimSpace(obj.ExternalKind) == "" && strings.TrimSpace(existing.ExternalKind) != "" {
+				kind = cloudNormalizeKind(existing.ExternalKind, obj.ProviderMeta)
+			}
+			meta = copyCloudProviderMeta(existing.ProviderMeta)
+		}
+	}
+	if len(obj.ProviderMeta) > 0 {
+		if meta == nil {
+			meta = make(map[string]any, len(obj.ProviderMeta))
+		}
+		for key, value := range obj.ProviderMeta {
+			meta[key] = value
+		}
+	}
+	if hasRemoteChild && cloudRemoteObjectShouldBeWikiParent(kind, meta) && !cloudWikiPageWithChildren(kind, meta) {
+		if meta == nil {
+			meta = make(map[string]any, 1)
+		}
+		meta["has_child"] = true
+	}
+	return kind, meta
+}
+
+func copyCloudProviderMeta(meta map[string]any) map[string]any {
+	if len(meta) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(meta))
+	for key, value := range meta {
+		out[key] = value
+	}
+	return out
+}
+
+func cloudRemoteObjectShouldBeWikiParent(kind string, meta map[string]any) bool {
+	if cloudWikiPageObject(kind, meta) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "doc", "docx":
+		return true
+	default:
+		return false
+	}
+}
+
+func cloudWikiPageShouldFold(objectPath, kind string, meta map[string]any) bool {
+	if !cloudWikiPageObject(kind, meta) {
+		return false
+	}
+	if cloudWikiPageWithChildren(kind, meta) {
+		return true
+	}
+	cleanPath := filepath.Clean(strings.TrimSpace(objectPath))
+	base := filepath.Base(cleanPath)
+	parent := filepath.Base(filepath.Dir(cleanPath))
+	if base == "." || parent == "." || parent == string(filepath.Separator) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSuffix(base, filepath.Ext(base)), parent)
+}
+
 func cloudNormalizeKind(kind string, meta map[string]any) string {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	if kind != "" {
@@ -1721,6 +2230,78 @@ func cloudIsDirKind(kind string) bool {
 	}
 }
 
+func cloudObjectDisplayTitle(objectPath string, obj cloudprovider.RemoteObject, isDir bool) string {
+	title := strings.TrimSpace(obj.ExternalName)
+	if !isDir {
+		base := strings.TrimSpace(filepath.Base(filepath.Clean(objectPath)))
+		parent := strings.TrimSpace(filepath.Base(filepath.Dir(filepath.Clean(objectPath))))
+		if title == "" && base != "" && base != "." && base != string(filepath.Separator) {
+			title = base
+		} else if base != "" && strings.EqualFold(parent, title) {
+			title = base
+		}
+	}
+	if title == "" {
+		title = cloudNodeTitleFromPath(objectPath)
+	}
+	return title
+}
+
+func cloudObjectTreePath(objectPath, kind string, meta map[string]any) string {
+	objectPath = filepath.Clean(strings.TrimSpace(objectPath))
+	if objectPath == "" || objectPath == "." {
+		return objectPath
+	}
+	if !cloudWikiPageShouldFold(objectPath, kind, meta) {
+		return objectPath
+	}
+	parent := filepath.Clean(filepath.Dir(objectPath))
+	if parent == "" || parent == "." {
+		return objectPath
+	}
+	return parent
+}
+
+func cloudTreePathByObjectID(
+	rootPath string,
+	objectID string,
+	objects []cloudprovider.RemoteObject,
+	existingByID map[string]store.CloudObjectIndexRecord,
+	pathOwner map[string]string,
+) string {
+	objectID = strings.TrimSpace(objectID)
+	if objectID == "" {
+		return ""
+	}
+	for _, obj := range objects {
+		if strings.TrimSpace(obj.ExternalObjectID) != objectID {
+			continue
+		}
+		kind, providerMeta := cloudObjectKindAndMeta(obj, existingByID, cloudRemoteObjectHasChild(objectID, objects))
+		pathObject := obj
+		pathObject.ProviderMeta = providerMeta
+		objectPath, _ := cloudResolveObjectPath(rootPath, pathObject, kind, existingByID, pathOwner)
+		if objectPath == "" {
+			return ""
+		}
+		return cloudObjectTreePath(objectPath, kind, providerMeta)
+	}
+	return ""
+}
+
+func cloudRemoteObjectHasChild(objectID string, objects []cloudprovider.RemoteObject) bool {
+	objectID = strings.TrimSpace(objectID)
+	if objectID == "" {
+		return false
+	}
+	for _, obj := range objects {
+		if strings.TrimSpace(obj.ExternalParentID) == objectID {
+			return true
+		}
+	}
+	return false
+}
+
 func cloudResolveObjectPath(
 	rootPath string,
 	obj cloudprovider.RemoteObject,
@@ -1733,7 +2314,8 @@ func cloudResolveObjectPath(
 	if rootPath == "" || rootPath == "." || objectID == "" {
 		return "", ""
 	}
-	if existing, ok := existingByID[objectID]; ok {
+	useCanonicalPath := cloudWikiPageWithChildren(kind, obj.ProviderMeta)
+	if existing, ok := existingByID[objectID]; ok && !useCanonicalPath {
 		rel := strings.Trim(strings.ReplaceAll(strings.TrimSpace(existing.LocalRelPath), "\\", "/"), "/")
 		if rel != "" {
 			absFromRel := filepath.Clean(filepath.Join(rootPath, filepath.FromSlash(rel)))
@@ -1756,7 +2338,7 @@ func cloudResolveObjectPath(
 			return abs, rel
 		}
 	}
-	rel := cloudSanitizeRelativePath(obj.ExternalPath, obj.ExternalName, objectID, kind)
+	rel := cloudSanitizeRelativePathForObject(obj, objectID, kind)
 	rel = cloudResolvePathCollision(rel, objectID, pathOwner)
 	abs := filepath.Clean(filepath.Join(rootPath, filepath.FromSlash(rel)))
 	return abs, rel
@@ -1780,6 +2362,18 @@ func cloudSanitizeRelativePath(externalPath, externalName, objectID, kind string
 		case "doc", "docx":
 			rel += ".md"
 		}
+	}
+	return rel
+}
+
+func cloudSanitizeRelativePathForObject(obj cloudprovider.RemoteObject, objectID, kind string) string {
+	rel := cloudSanitizeRelativePath(obj.ExternalPath, obj.ExternalName, objectID, kind)
+	if cloudWikiPageWithChildren(kind, obj.ProviderMeta) {
+		dir := strings.TrimSuffix(rel, path.Ext(rel))
+		if dir == "" || dir == "." {
+			dir = cloudSanitizeName(cloudFirstNonEmptyString(obj.ExternalName, objectID))
+		}
+		rel = path.Join(dir, path.Base(rel))
 	}
 	return rel
 }
@@ -1882,6 +2476,10 @@ func cloudEnsureAncestorNodes(nodeMap map[string]*model.TreeNode, childMap map[s
 }
 
 func cloudEnsureNode(nodeMap map[string]*model.TreeNode, childMap map[string]map[string]struct{}, nodePath string, isDir bool, title, externalFileID string) {
+	cloudEnsureNodeWithParent(nodeMap, childMap, nodePath, "", isDir, title, externalFileID)
+}
+
+func cloudEnsureNodeWithParent(nodeMap map[string]*model.TreeNode, childMap map[string]map[string]struct{}, nodePath, parentPath string, isDir bool, title, externalFileID string) {
 	nodePath = filepath.Clean(strings.TrimSpace(nodePath))
 	if nodePath == "" || nodePath == "." {
 		return
@@ -1902,17 +2500,23 @@ func cloudEnsureNode(nodeMap map[string]*model.TreeNode, childMap map[string]map
 		}
 		nodeMap[nodePath] = node
 	} else {
-		if isDir {
+		if !isDir {
+			node.IsDir = false
+			if strings.TrimSpace(externalFileID) != "" {
+				node.ExternalFileID = strings.TrimSpace(externalFileID)
+			}
+		} else if node.IsDir {
 			node.IsDir = true
 			node.ExternalFileID = ""
-		} else if !node.IsDir && node.ExternalFileID == "" {
-			node.ExternalFileID = strings.TrimSpace(externalFileID)
 		}
 		if strings.TrimSpace(node.Title) == "" || node.Title == cloudNodeTitleFromPath(nodePath) {
 			node.Title = title
 		}
 	}
-	parent := filepath.Clean(filepath.Dir(nodePath))
+	parent := filepath.Clean(strings.TrimSpace(parentPath))
+	if parent == "" || parent == "." {
+		parent = filepath.Clean(filepath.Dir(nodePath))
+	}
 	if parent == "" || parent == "." {
 		parent = string(filepath.Separator)
 	}
@@ -1943,10 +2547,15 @@ func cloudBuildTreeNodes(rootPath string, nodeMap map[string]*model.TreeNode, ch
 		sort.Slice(keys, func(i, j int) bool {
 			left := nodeMap[keys[i]]
 			right := nodeMap[keys[j]]
-			if left.IsDir != right.IsDir {
-				return left.IsDir
+			leftTitle := strings.ToLower(strings.TrimSpace(left.Title))
+			rightTitle := strings.ToLower(strings.TrimSpace(right.Title))
+			if leftTitle == rightTitle {
+				if left.IsDir != right.IsDir {
+					return left.IsDir
+				}
+				return left.Key < right.Key
 			}
-			return strings.ToLower(strings.TrimSpace(left.Title)) < strings.ToLower(strings.TrimSpace(right.Title))
+			return leftTitle < rightTitle
 		})
 		nodes := make([]model.TreeNode, 0, len(keys))
 		for _, key := range keys {
@@ -1955,7 +2564,7 @@ func cloudBuildTreeNodes(rootPath string, nodeMap map[string]*model.TreeNode, ch
 				continue
 			}
 			node := *base
-			if node.IsDir {
+			if len(childMap[key]) > 0 {
 				node.Children = walk(key)
 			}
 			nodes = append(nodes, node)
@@ -1976,6 +2585,31 @@ func cloudNodeTitleFromPath(p string) string {
 func cloudShortHash(value string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
 	return hex.EncodeToString(sum[:4])
+}
+
+func cloudBoolOption(m map[string]any, key string) bool {
+	if len(m) == 0 {
+		return false
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return false
+	}
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		x = strings.TrimSpace(strings.ToLower(x))
+		return x == "true" || x == "1" || x == "yes"
+	case int:
+		return x != 0
+	case int64:
+		return x != 0
+	case float64:
+		return x != 0
+	default:
+		return strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", v)), "true")
+	}
 }
 
 func cloudSanitizeName(v string) string {
@@ -2173,18 +2807,40 @@ func filterTreeToChanged(items []model.TreeNode) []model.TreeNode {
 	out := make([]model.TreeNode, 0, len(items))
 	for _, node := range items {
 		item := node
-		if item.IsDir {
+		if len(item.Children) > 0 {
 			item.Children = filterTreeToChanged(item.Children)
+		}
+		if item.IsDir {
 			if len(item.Children) > 0 || nodeHasChanged(item) {
 				out = append(out, item)
 			}
 			continue
 		}
-		if nodeHasChanged(item) {
+		if len(item.Children) > 0 || nodeHasChanged(item) {
 			out = append(out, item)
 		}
 	}
 	return out
+}
+
+func filterTreeByKeyword(items []model.TreeNode, keyword string) []model.TreeNode {
+	normalized := strings.ToLower(strings.TrimSpace(keyword))
+	if normalized == "" {
+		return items
+	}
+	out := make([]model.TreeNode, 0, len(items))
+	for _, node := range items {
+		item := node
+		item.Children = filterTreeByKeyword(item.Children, normalized)
+		if treeNodeMatchesKeyword(item, normalized) || len(item.Children) > 0 {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func treeNodeMatchesKeyword(node model.TreeNode, normalizedKeyword string) bool {
+	return strings.Contains(strings.ToLower(node.Title), normalizedKeyword)
 }
 
 func nodeHasChanged(node model.TreeNode) bool {
@@ -2204,8 +2860,13 @@ func (h *Handler) searchCoreTaskStates(ctx context.Context, refs []store.SourceD
 	if len(refs) == 0 {
 		return states, nil
 	}
-	byDataset := make(map[string][]string, 4)
-	seenByDataset := make(map[string]map[string]struct{}, 4)
+	type datasetUserKey struct {
+		datasetID string
+		userID    string
+		userName  string
+	}
+	byDatasetUser := make(map[datasetUserKey][]string, 4)
+	seenByDatasetUser := make(map[datasetUserKey]map[string]struct{}, 4)
 	legacyIDs := make([]string, 0, len(refs))
 	legacySeen := make(map[string]struct{}, len(refs))
 	for _, ref := range refs {
@@ -2222,19 +2883,24 @@ func (h *Handler) searchCoreTaskStates(ctx context.Context, refs []store.SourceD
 			legacyIDs = append(legacyIDs, taskID)
 			continue
 		}
-		if _, ok := seenByDataset[datasetID]; !ok {
-			seenByDataset[datasetID] = make(map[string]struct{}, 16)
+		key := datasetUserKey{
+			datasetID: datasetID,
+			userID:    strings.TrimSpace(ref.SourceCreateUserID),
+			userName:  strings.TrimSpace(ref.SourceCreateUserName),
 		}
-		if _, ok := seenByDataset[datasetID][taskID]; ok {
+		if _, ok := seenByDatasetUser[key]; !ok {
+			seenByDatasetUser[key] = make(map[string]struct{}, 16)
+		}
+		if _, ok := seenByDatasetUser[key][taskID]; ok {
 			continue
 		}
-		seenByDataset[datasetID][taskID] = struct{}{}
-		byDataset[datasetID] = append(byDataset[datasetID], taskID)
+		seenByDatasetUser[key][taskID] = struct{}{}
+		byDatasetUser[key] = append(byDatasetUser[key], taskID)
 	}
-	for datasetID, taskIDs := range byDataset {
-		datasetStates, err := h.core.SearchTasksByDataset(ctx, datasetID, taskIDs)
+	for key, taskIDs := range byDatasetUser {
+		datasetStates, err := h.core.SearchTasksByDatasetAs(ctx, key.datasetID, taskIDs, key.userID, key.userName)
 		if err != nil {
-			return nil, fmt.Errorf("dataset %s search failed: %w", datasetID, err)
+			return nil, fmt.Errorf("dataset %s search failed: %w", key.datasetID, err)
 		}
 		for taskID, st := range datasetStates {
 			states[taskID] = st
@@ -2306,15 +2972,17 @@ func sourceDocumentItemsCoreRefs(items []model.SourceDocumentItem) []store.Sourc
 			continue
 		}
 		refs = append(refs, store.SourceDocumentCoreRef{
-			DocumentID:       item.DocumentID,
-			ParseStatus:      item.ParseState,
-			DesiredVersionID: item.DesiredVersionID,
-			CurrentVersionID: item.CurrentVersionID,
-			TaskID:           item.ParseTaskID,
-			TaskAction:       item.ParseTaskAction,
-			TargetVersionID:  item.ParseTaskTargetVersion,
-			CoreDatasetID:    strings.TrimSpace(item.CoreDatasetID),
-			CoreTaskID:       taskID,
+			DocumentID:           item.DocumentID,
+			SourceCreateUserID:   strings.TrimSpace(item.SourceCreateUserID),
+			SourceCreateUserName: strings.TrimSpace(item.SourceCreateUserName),
+			ParseStatus:          item.ParseState,
+			DesiredVersionID:     item.DesiredVersionID,
+			CurrentVersionID:     item.CurrentVersionID,
+			TaskID:               item.ParseTaskID,
+			TaskAction:           item.ParseTaskAction,
+			TargetVersionID:      item.ParseTaskTargetVersion,
+			CoreDatasetID:        strings.TrimSpace(item.CoreDatasetID),
+			CoreTaskID:           taskID,
 		})
 	}
 	return refs
@@ -2328,12 +2996,14 @@ func parseTaskItemsCoreRefs(items []model.ParseTaskListItem) []store.SourceDocum
 			continue
 		}
 		refs = append(refs, store.SourceDocumentCoreRef{
-			DocumentID:      item.DocumentID,
-			TaskID:          item.TaskID,
-			TaskAction:      item.TaskAction,
-			TargetVersionID: item.TargetVersionID,
-			CoreDatasetID:   strings.TrimSpace(item.CoreDatasetID),
-			CoreTaskID:      taskID,
+			DocumentID:           item.DocumentID,
+			SourceCreateUserID:   strings.TrimSpace(item.SourceCreateUserID),
+			SourceCreateUserName: strings.TrimSpace(item.SourceCreateUserName),
+			TaskID:               item.TaskID,
+			TaskAction:           item.TaskAction,
+			TargetVersionID:      item.TargetVersionID,
+			CoreDatasetID:        strings.TrimSpace(item.CoreDatasetID),
+			CoreTaskID:           taskID,
 		})
 	}
 	return refs

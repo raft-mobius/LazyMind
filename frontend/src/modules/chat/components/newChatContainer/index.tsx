@@ -5,7 +5,7 @@ import {
   forwardRef,
   useImperativeHandle,
   useCallback,
-  ReactElement,
+  ReactNode,
 } from "react";
 import { Spin, Flex, message } from "antd";
 import {
@@ -61,7 +61,7 @@ export interface ChatImperativeProps {
 
 interface Props {
   canChat?: boolean;
-  initialCard?: ReactElement | string;
+  initialCard?: ReactNode;
   sessionId?: string;
   onOpenSSE: (
     input: any[],
@@ -74,12 +74,14 @@ interface Props {
   ) => any;
   onConversationIdChange?: (conversationId: string) => void;
   parseErrorData: (data: string) => string;
-  setShowHistoryList: (show: boolean) => void;
-  showHistoryList: boolean;
+  setShowHistoryList?: (show: boolean) => void;
+  showHistoryList?: boolean;
+  showHistoryButton?: boolean;
   setIsChatContent: (isChatContent: boolean) => void;
   chatConfig?: ChatConfig;
   setChatConfig?: (chatConfig: ChatConfig) => void;
   setChatConfigFn: (chatConfig: ChatConfig) => void;
+  knowledgeRefreshKey?: number | string;
 }
 
 export interface ChatMessage {
@@ -127,10 +129,12 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       parseErrorData,
       setShowHistoryList,
       showHistoryList,
+      showHistoryButton = true,
       setIsChatContent,
       chatConfig,
       setChatConfig,
       setChatConfigFn,
+      knowledgeRefreshKey,
     } = props;
     const { getModelSelection, setModelSelection, resetForNewChat } =
       useModelSelectionStore();
@@ -141,7 +145,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
           sessId ?? sessionId ?? currentConversationIdRef.current ?? "";
         if (preference === "prefer_first") {
           setModelSelection(sid, "value_engineering");
-          message.success("后续回答将为 LazyRAG 大模型");
+          message.success("后续回答将为 LazyMind 大模型");
         } else if (preference === "prefer_second") {
           setModelSelection(sid, "deepseek");
           message.success("后续回答将为DeepSeek");
@@ -168,6 +172,8 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
     const [messageList, setMessageList] = useState<any[]>([]);
     const [loading, setLoading] = useState(false);
     const [content, setContent] = useState("");
+    const [editingUserMessageIndex, setEditingUserMessageIndex] = useState<number | null>(null);
+    const [editingUserMessageText, setEditingUserMessageText] = useState("");
     const [thinkingCollapseMap, setThinkingCollapseMap] = useState<
       Map<string, boolean>
     >(new Map());
@@ -207,6 +213,20 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       };
     }, []);
 
+    useEffect(() => {
+      if (editingUserMessageIndex === null) {
+        return;
+      }
+      if (
+        editingUserMessageIndex < 0 ||
+        editingUserMessageIndex >= messageList.length ||
+        messageList[editingUserMessageIndex]?.role !== RoleTypes.USER
+      ) {
+        setEditingUserMessageIndex(null);
+        setEditingUserMessageText("");
+      }
+    }, [editingUserMessageIndex, messageList]);
+
     function getFileUrls(
       files: (RcFile & { uri: string })[] | undefined,
       images?: ChatImage[],
@@ -232,7 +252,8 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
 
     function sendMessage(params: SendMessageParams) {
       const { text, clearInput = true, create_time } = params;
-      if (activeStreamRef.current || loading || !canChat || !text) {
+      const normalizedText = text.trim();
+      if (activeStreamRef.current || loading || !canChat || !normalizedText) {
         return;
       }
 
@@ -259,7 +280,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
         }) ?? {};
 
       const inputs = [
-        { input_type: "text", text },
+        { input_type: "text", text: normalizedText },
         ...getFileUrls(tempFileGroup?.image, tempGroup?.image).map((image) => {
           return {
             input_type: "image",
@@ -281,7 +302,7 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
       );
 
       const userMessage = {
-        delta: text,
+        delta: normalizedText,
         role: RoleTypes.USER,
         images: tempGroup?.image,
         files: tempGroup?.file,
@@ -947,6 +968,8 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
 
       setMessageList([]);
       messageListRef.current = [];
+      setEditingUserMessageIndex(null);
+      setEditingUserMessageText("");
       setLoading(false);
       setIS_STREAMING(false);
 
@@ -1043,6 +1066,113 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
         regenerationInputs,
         ChatConversationsRequestActionEnum.ChatActionRegeneration,
       );
+    }
+
+    async function handleCopyUserMessage(item: any) {
+      const text = (item?.delta || "").trim();
+      if (!text) {
+        return;
+      }
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(text);
+          message.success(t("chat.copySuccess"));
+          return;
+        }
+      } catch {
+      }
+
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.top = "0";
+      textarea.style.left = "0";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      try {
+        const copied = document.execCommand("copy");
+        if (copied) {
+          message.success(t("chat.copySuccess"));
+        } else {
+          message.error(t("chat.copyFailedManual"));
+        }
+      } finally {
+        document.body.removeChild(textarea);
+      }
+    }
+
+    function handleStartEditUserMessage(item: any, index: number) {
+      if (loading || activeStreamRef.current) {
+        return;
+      }
+      setEditingUserMessageIndex(index);
+      setEditingUserMessageText(item?.delta || "");
+    }
+
+    function handleCancelEditUserMessage() {
+      setEditingUserMessageIndex(null);
+      setEditingUserMessageText("");
+    }
+
+    function handleResendEditedUserMessage(index: number, value: string) {
+      if (loading || activeStreamRef.current) {
+        return;
+      }
+      const normalizedText = value.trim();
+      if (!normalizedText) {
+        return;
+      }
+
+      const oldUserMessage = messageListRef.current[index];
+      if (!oldUserMessage || oldUserMessage.role !== RoleTypes.USER) {
+        return;
+      }
+
+      const oldInputs = Array.isArray(oldUserMessage.inputs) ? oldUserMessage.inputs : [];
+      const rebuiltInputs = oldInputs
+        .filter((input: any) => (input?.input_type || "text") !== "text")
+        .map((input: any) => ({ ...input }));
+      rebuiltInputs.unshift({ input_type: "text", text: normalizedText });
+
+      const newUserMessage = {
+        ...oldUserMessage,
+        delta: normalizedText,
+        inputs: rebuiltInputs,
+      };
+
+      const currentModelSelection = getModelSelection(
+        currentConversationIdRef.current || sessionId,
+      );
+      const assistantMessage = {
+        role: RoleTypes.ASSISTANT,
+        delta: "",
+        reasoning_content: "",
+        finish_reason:
+          ChatConversationsResponseFinishReasonEnum.FinishReasonUnspecified,
+        answers: [],
+        sources: [],
+        model_mode: currentModelSelection,
+      };
+
+      const truncated = messageListRef.current.slice(0, index);
+      const newList = [...truncated, newUserMessage, assistantMessage];
+      messageListRef.current = newList;
+      setMessageList(newList);
+      setEditingUserMessageIndex(null);
+      setEditingUserMessageText("");
+
+      const currentId = currentConversationIdRef.current;
+      if (currentId) {
+        conversationMessagesCache.current.set(currentId, newList);
+        streamManager.saveMessageList(currentId, newList);
+      }
+
+      isMouseScrollingRef.current = true;
+      scrollToEnd();
+      openSSE(rebuiltInputs, ChatConversationsRequestActionEnum.ChatActionRegeneration);
     }
 
     function renderText(item: any, uniqueKey?: string) {
@@ -1231,6 +1361,13 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
             chatContentRef={chatContentRef}
             sessionId={sessionId}
             onPreferenceSelect={handlePreferenceSelect}
+            editingUserMessageIndex={editingUserMessageIndex}
+            editingUserMessageText={editingUserMessageText}
+            onUserMessageEditTextChange={setEditingUserMessageText}
+            onStartEditUserMessage={handleStartEditUserMessage}
+            onCancelEditUserMessage={handleCancelEditUserMessage}
+            onResendEditedUserMessage={handleResendEditedUserMessage}
+            onCopyUserMessage={handleCopyUserMessage}
           />
 
           {messageList.length > 0 && (
@@ -1255,15 +1392,19 @@ const ChatContainerComponent = forwardRef<ChatImperativeProps, Props>(
             value={content}
             onChange={setContent}
             onSend={sendMessage}
-            openHistory={() => setShowHistoryList(true)}
+            openHistory={
+              setShowHistoryList ? () => setShowHistoryList(true) : undefined
+            }
             isChatContent={true}
             showHistoryList={showHistoryList}
+            showHistoryButton={showHistoryButton}
             openNewChat={createNewChat}
             ref={chatInputRef}
             onHeightChange={handleInputHeightChange}
             chatConfig={chatConfig}
             setChatConfig={setChatConfig}
             setChatConfigFn={setChatConfigFn}
+            knowledgeRefreshKey={knowledgeRefreshKey}
             sessionId={sessionId}
             isStreaming={IS_STREAMING}
           />

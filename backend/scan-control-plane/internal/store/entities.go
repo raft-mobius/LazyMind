@@ -4,17 +4,18 @@ import "time"
 
 type sourceEntity struct {
 	ID                    string     `gorm:"column:id;type:text;primaryKey"`
-	TenantID              string     `gorm:"column:tenant_id;type:text;not null;index:idx_sources_tenant;uniqueIndex:uk_sources_tenant_agent_root,priority:1"`
+	TenantID              string     `gorm:"column:tenant_id;type:text;not null;index:idx_sources_tenant;index:idx_sources_tenant_creator,priority:1;uniqueIndex:uk_sources_tenant_agent_root,priority:1"`
+	CreateUserID          string     `gorm:"column:create_user_id;type:text;not null;default:'';index:idx_sources_tenant_creator,priority:2;uniqueIndex:uk_sources_tenant_agent_root,priority:2"`
 	Name                  string     `gorm:"column:name;type:text;not null"`
 	SourceType            string     `gorm:"column:source_type;type:text;not null"`
-	RootPath              string     `gorm:"column:root_path;type:text;not null;uniqueIndex:uk_sources_tenant_agent_root,priority:3"`
+	RootPath              string     `gorm:"column:root_path;type:text;not null;uniqueIndex:uk_sources_tenant_agent_root,priority:4"`
 	Status                string     `gorm:"column:status;type:text;not null"`
 	WatchEnabled          bool       `gorm:"column:watch_enabled;not null;default:false"`
 	WatchUpdatedAt        *time.Time `gorm:"column:watch_updated_at"`
 	IdleWindowSeconds     int64      `gorm:"column:idle_window_seconds;not null"`
 	ReconcileSeconds      int64      `gorm:"column:reconcile_seconds;not null"`
 	ReconcileSchedule     string     `gorm:"column:reconcile_schedule;type:text"`
-	AgentID               string     `gorm:"column:agent_id;type:text;not null;uniqueIndex:uk_sources_tenant_agent_root,priority:2"`
+	AgentID               string     `gorm:"column:agent_id;type:text;not null;uniqueIndex:uk_sources_tenant_agent_root,priority:3"`
 	DatasetID             string     `gorm:"column:dataset_id;type:text"`
 	DefaultOriginType     string     `gorm:"column:default_origin_type;type:text;not null;default:LOCAL_FS"`
 	DefaultOriginPlatform string     `gorm:"column:default_origin_platform;type:text;not null;default:LOCAL"`
@@ -164,6 +165,41 @@ type documentEntity struct {
 }
 
 func (documentEntity) TableName() string { return "documents" }
+
+type sourceDocumentStateEntity struct {
+	ID                int64      `gorm:"column:id;primaryKey;autoIncrement"`
+	TenantID          string     `gorm:"column:tenant_id;type:text;not null;index:idx_source_document_states_tenant_source,priority:1"`
+	SourceID          string     `gorm:"column:source_id;type:text;not null;uniqueIndex:uk_source_document_state_object,priority:1;index:idx_source_document_states_source_state,priority:1;index:idx_source_document_states_next_sync,priority:1;index:idx_source_document_states_path,priority:1;index:idx_source_document_states_tenant_source,priority:2"`
+	ObjectKey         string     `gorm:"column:object_key;type:text;not null;uniqueIndex:uk_source_document_state_object,priority:2"`
+	Path              string     `gorm:"column:path;type:text;not null;index:idx_source_document_states_path,priority:2"`
+	Name              string     `gorm:"column:name;type:text"`
+	IsDir             bool       `gorm:"column:is_dir;not null;default:false"`
+	SourceExists      bool       `gorm:"column:source_exists;not null;default:true"`
+	OriginType        string     `gorm:"column:origin_type;type:text"`
+	OriginPlatform    string     `gorm:"column:origin_platform;type:text"`
+	OriginRef         string     `gorm:"column:origin_ref;type:text"`
+	SourceVersion     string     `gorm:"column:source_version;type:text"`
+	BaselineVersion   string     `gorm:"column:baseline_version;type:text"`
+	SourceChecksum    string     `gorm:"column:source_checksum;type:text"`
+	SourceSizeBytes   int64      `gorm:"column:source_size_bytes;not null;default:0"`
+	SourceModifiedAt  *time.Time `gorm:"column:source_modified_at"`
+	SourceState       string     `gorm:"column:source_state;type:text;not null;index:idx_source_document_states_source_state,priority:2"`
+	SyncState         string     `gorm:"column:sync_state;type:text;not null;index:idx_source_document_states_source_state,priority:3"`
+	PendingAction     string     `gorm:"column:pending_action;type:text;not null"`
+	NextSyncAt        *time.Time `gorm:"column:next_sync_at;index:idx_source_document_states_next_sync,priority:2"`
+	DocumentID        int64      `gorm:"column:document_id;index:idx_source_document_states_document"`
+	CoreDocumentID    string     `gorm:"column:core_document_id;type:text"`
+	ActiveTaskID      int64      `gorm:"column:active_task_id;index:idx_source_document_states_active_task"`
+	LastDetectedAt    time.Time  `gorm:"column:last_detected_at;not null"`
+	LastSyncedAt      *time.Time `gorm:"column:last_synced_at"`
+	LastError         string     `gorm:"column:last_error;type:text"`
+	DeletedAtSource   *time.Time `gorm:"column:deleted_at_source"`
+	KnowledgeBaseSeen bool       `gorm:"column:knowledge_base_seen;not null;default:false"`
+	CreatedAt         time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt         time.Time  `gorm:"column:updated_at;not null"`
+}
+
+func (sourceDocumentStateEntity) TableName() string { return "source_document_states" }
 
 type parseTaskEntity struct {
 	ID                      int64      `gorm:"column:id;primaryKey;autoIncrement"`

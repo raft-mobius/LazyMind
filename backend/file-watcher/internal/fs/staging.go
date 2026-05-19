@@ -15,8 +15,8 @@ import (
 
 	"go.uber.org/zap"
 
-	internal "github.com/lazyrag/file_watcher/internal"
-	"github.com/lazyrag/file_watcher/internal/config"
+	internal "github.com/lazymind/file_watcher/internal"
+	"github.com/lazymind/file_watcher/internal/config"
 )
 
 // StagingService stages files.
@@ -63,6 +63,9 @@ func (s *stagingService) StageFile(_ context.Context, sourceID, documentID, vers
 	}
 	if srcInfo.IsDir() {
 		return internal.StageResult{}, fmt.Errorf("%s: source path is a directory", internal.ErrStageFailed)
+	}
+	if isTransientFile(srcPath, false) {
+		return internal.StageResult{}, fmt.Errorf("%s: transient editor file is ignored", internal.ErrStageFailed)
 	}
 
 	s.mu.Lock()
