@@ -1,22 +1,3 @@
-# LazyMind Windows Desktop HLD
-
-
-## 0. 文档定位与命名约定
-
-### 0.1 文档定位
-
-本文描述 LazyMind Windows Desktop Mode 的高层设计，目标是在保留现有 Cloud/Server Mode 的前提下，把 LazyRAG/LazyMind 当前 Web + 后端服务形态改造成一个 Windows 优先的桌面应用。
-
-本文覆盖：
-
-- 原始需求与已对齐决议。
-- 需求分析与需求细化。
-- HLD 级总体架构与技术设计。
-- MVP、完整功能、安装包三个阶段的任务拆分与依赖识别。
-- 每个阶段的 HLD 方案设计。
-
-本文不覆盖：
-
 - 代码级 LLD。
 - API 字段级定义。
 - 数据库 migration 逐条改写方案。
@@ -700,10 +681,12 @@ Desktop Mode 前台只有“AI 助手”概念。
 - 默认首个 AI 助手头像为 `🪐`。
 - 默认首个 AI 助手描述为：`天文学家是一位专注于太阳系、行星、卫星、小行星、彗星和基础天文知识的入门向导，擅长用清晰、耐心、富有画面感的方式解释宇宙中的常见现象，帮助用户从太阳系开始建立对天文学的整体认识。`
 - 默认数据目录内置约 100KB 的太阳系知识 Markdown 示例文档，作为首次启动演示内容。
+- MVP 阶段如果 RAG 链路仍处于 mock 或弱效果状态，首次启动演示只保证样例文档可见、Chat 明确提示 mock 状态；基于该文档的真实 RAG 问答放到完整功能阶段验收。
 - 用户可以创建多个 AI 助手。
 - 新建 AI 助手字段与现有新建用户字段保持一致。
 - 用户可以通过全局顶部 Assistant Switcher 切换当前 AI 助手。
 - 每个助手有自己的技能、知识、会话、偏好。
+- AI 助手数量、删除 / 归档、默认组绑定清理和助手级数据清理需要在 LLD 中明确；完整功能阶段至少验证 50 个助手的创建、切换和隔离行为。
 
 ### 3.7.2 后台模型
 
@@ -715,6 +698,7 @@ Desktop Mode 前台只有“AI 助手”概念。
 - 默认组和默认写权限自动绑定。
 - 不引入主用户 / 子用户。
 - 不引入 actor / effective user 双身份模型。
+- 删除或归档 AI 助手时，需要清理或停用后台用户、默认组绑定、会话、技能、知识库引用和事件循环状态；具体保留策略进入 LLD。
 
 ### 3.7.3 请求上下文
 
@@ -752,7 +736,9 @@ Windows 默认用户数据目录建议：
   config.yaml
   data\
     main.db
+    auth.db
     algo.db
+    scan.db
   vector\
     milvus-lite\
   segment\
@@ -781,7 +767,9 @@ macOS 后续低成本预留，不作为 Windows MVP 验收重点：
   config.yaml
   data/
     main.db
+    auth.db
     algo.db
+    scan.db
   vector/
     milvus-lite/
   segment/
@@ -825,8 +813,15 @@ Desktop Mode 使用 SQLite 承载关系数据。
 - 不能只改连接串。
 - migration / seed SQL 要兼容 SQLite。
 - 需要治理 PostgreSQL 特有语法。
-- 需要考虑多进程写锁。
-- 必要时拆分 DB 文件或收敛写入服务。
+- Desktop Mode 默认不采用多个后端进程共同写同一个 SQLite 文件的模式。
+- 关系库按服务 ownership 拆分，跨服务读写通过 API 或事件，不通过跨库 SQL JOIN。
+- 推荐初始 ownership：
+  - `main.db`：core 独占写，承载会话、技能、记忆、偏好、模型配置、业务状态等 core 数据。
+  - `auth.db`：auth-service 独占写，承载用户 / AI 助手、组、角色、权限、token 或 Desktop Auth Provider 所需数据。
+  - `scan.db`：scan-control-plane / file-watcher 独占写，承载扫描源、文件状态、任务游标、文件变化状态。
+  - `algo.db`：algorithm / parsing / processor / doc-service 独占写，承载解析任务、算法文档任务、算法侧管理表。
+- 每个 SQLite 文件启用 `WAL`、`busy_timeout`、`foreign_keys` 等基础 pragmas，但 WAL 只作为缓解手段，不作为多写共享库的设计依据。
+- 如果后续证明某个服务必须写入另一个服务的数据，应优先改为该 owner 服务提供 API；只有在 API 调用成本不可接受时，才在 LLD 中明确单写服务或合并进程方案。
 
 ### 3.10.2 向量数据
 
@@ -839,6 +834,14 @@ HLD 原则：
 - 安装包阶段继续以 Milvus Lite 作为默认打包目标。
 - 暂不把 LanceDB、Qdrant 等作为并行方案纳入主线设计。
 - 如果 MVP 验证发现 Milvus Lite 在 Windows 安装、打包、稳定性、性能、数据目录、依赖冲突等方面不理想，再根据测试结果更新方案。
+
+Milvus Lite Go / No-Go 初始判定标准：
+
+- 在支持矩阵中的干净 Windows x64 环境中，安装、启动、创建 collection、写入、查询、删除、重启恢复 smoke 必须全部通过。
+- 打包后的 Python 服务必须能在无 Python 开发环境的 Windows 环境中完成同一组 smoke；如果 PyInstaller / Nuitka 产物无法稳定运行，必须触发方案更新。
+- 以 MVP 目标数据集规模进行验证时，常规 top-k 查询 P95 应低于 1s，P99 应低于 2s；超过该范围需要记录瓶颈并评估是否仍可接受。
+- Milvus Lite 数据目录必须能完整放在用户数据目录下，支持应用重启后继续读写；无法定位、迁移或清理用户数据目录时触发方案更新。
+- 单次 smoke 中出现可复现崩溃、数据损坏、进程无法退出、依赖冲突或杀毒软件持续拦截且无低成本规避方式时，触发方案更新。
 
 ### 3.10.3 片段 / 全文检索数据
 
@@ -863,12 +866,32 @@ HLD 原则：
 - 应通过运行时存储接口隔离 Cloud Redis 与 Desktop 本地实现。
 - Desktop MVP 可用内存实现，完整功能阶段根据持久化需求再落 SQLite 或文件。
 
+当前需要重点覆盖的 Redis 语义包括：
+
+| 语义 | Cloud/Server Mode 现状 | Desktop Mode 方向 |
+|---|---|---|
+| Chat 状态 | 生成中 / 完成 / 失败状态使用 Redis hash 和 TTL 保存 | Runtime Store 提供状态接口；MVP 可内存实现，完整功能阶段按恢复需求落 `main.db` |
+| Chat 流式片段 | 流式 chunk 使用 Redis list 追加和 replay | 正常在线 SSE 直连仍由 core 转发 Python chat service；断线恢复、历史 replay 通过 Runtime Store 或 DB 明确实现 |
+| Chat 取消 | 取消信号使用 Redis list + blocking pop | Runtime Store 必须提供跨 goroutine / 进程的取消信号；不能只依赖前端断开连接 |
+| 多回答关联 | 主回答 / 副回答关联信息使用带 TTL 的 Redis key | Runtime Store 提供短生命周期关联记录 |
+| refresh token | auth-service 使用 Redis TTL key 保存 refresh token | Desktop 免登录场景可裁剪；如保留 token 语义，应落 `auth.db` 或 OS 安全存储 |
+| 登录限流 | auth-service 使用 Redis ZSET 做滑动窗口 | Desktop 免登录场景默认不需要；如保留登录入口，应落本地 Runtime Store 或 `auth.db` |
+
+Runtime Store LLD 必须回答：
+
+- Chat SSE 是由 core 统一转发 Python chat service，还是允许 Renderer 直连 chat service。
+- 断线恢复需要 replay 哪些 chunk，保留多长时间。
+- 取消信号需要跨哪些进程传播。
+- 哪些状态只需进程内存，哪些状态必须在应用重启后恢复。
+- Cloud Redis 实现和 Desktop 本地实现的行为对照测试范围。
+
 ## 3.11 算法与解析设计
 
 Desktop Mode 算法设计分层：
 
 - MVP：内置一套 mock server / mock backend，并作为默认配置；验证 Python 算法模块能启动、被调用、返回可控结果；不追求完整算法效果。
 - MVP Chat：当 mock 配置生效时，回答中或 Chat UI 中需要提示用户“当前模型配置处于 mock 状态，请到模型配置界面配置真实模型”。
+- MVP 首次启动示例 Markdown 主要用于验证默认目录、样例文档展示和后续知识库构建入口；只有当 Milvus Lite、SegmentStore 和真实模型配置均接入后，才把“打开即可基于太阳系文档问答”作为验收口径。
 - 完整功能：接入真实解析、索引、检索和问答闭环。
 - 安装包：验证 Python 依赖、Milvus Lite、解析依赖可随应用分发。
 
@@ -1081,6 +1104,32 @@ Desktop 安装包把可执行代码交付到用户机器，发布链路需要单
 
 本次 MVP 优先确保桌面运行环境迁移不会把 Web 前端问题、本地 API 问题、IPC 问题或打包发布问题放大成本机权限问题。
 
+## 3.16 启动体验与资源预算
+
+Desktop Mode 需要从 HLD 阶段设定资源边界，避免 Electron + 多后端进程 + Milvus Lite + Python 打包产物叠加后形成不可接受的桌面体验。
+
+初始目标：
+
+- 首屏可见：用户双击后 5 秒内展示主窗口、启动状态和可理解的 loading / splash，不出现空白页。
+- 核心可操作：Electron、Local Proxy、core、auth-service 初始化完成后，10 秒内进入可操作主界面；耗时功能显示局部 loading。
+- 完整能力就绪：Python chat / parsing / processor / scan 等非首屏必需服务可异步启动，30 秒内完成健康检查；未就绪功能需要显示明确状态。
+- 冷启动期间不阻塞窗口事件循环，Renderer 应能响应关闭、最小化和诊断入口。
+- MVP 阶段必须记录各进程启动耗时、内存峰值和健康检查耗时，作为后续服务合并和打包优化依据。
+
+启动分层：
+
+- 第一层：Electron Main、Renderer 静态资源、Local Proxy、数据目录、日志目录。
+- 第二层：core、auth-service、默认助手初始化、Desktop Auth Provider。
+- 第三层：chat service、Milvus Lite smoke、SegmentStore 本地实现、scan-control-plane、file-watcher。
+- 第四层：parsing、processor、doc-service、Office/OCR 线上 API 或本地可选能力。
+
+最低运行环境初始口径：
+
+- Windows 10 1903+ x64，Windows 11 x64 作为主要验证环境。
+- 8GB RAM 起步；低于 8GB 不作为 MVP 主要验收环境。
+- 安装包和运行时基础数据至少预留 2GB 可用磁盘空间；用户文档、模型缓存和索引数据另计。
+- 中文路径、空格路径、普通用户权限运行必须纳入安装包阶段验证。
+
 ---
 
 # 4. 分三个阶段的落地计划
@@ -1245,6 +1294,18 @@ MVP 不以完整算法效果为目标。
 - Local Proxy 和 Process Manager 的职责边界已确定。
 - 日志目录、数据目录和诊断包范围已确定。
 
+#### K. 启动与资源 smoke
+
+- 记录 Electron、core、auth-service、chat service、Milvus Lite smoke、scan-control-plane 的启动耗时。
+- 记录各后端进程启动后的内存占用。
+- 验证首屏可见、核心可操作、完整能力就绪三个启动层级。
+- 验证 Python 服务未就绪时，Chat、解析、扫盘等入口能展示明确状态，而不是空白或无响应。
+
+依赖：
+
+- Process Manager 已能采集健康检查和进程信息。
+- 前端已有基础服务状态展示。
+
 ### 4.1.3 MVP 阶段依赖顺序
 
 建议依赖顺序：
@@ -1260,7 +1321,8 @@ MVP 不以完整算法效果为目标。
 9. Chat / 技能主入口最小闭环。
 10. Milvus Lite MVP 验证。
 11. 扫盘复用验证。
-12. 诊断包与稳定性修正。
+12. 启动与资源 smoke。
+13. 诊断包与稳定性修正。
 
 ## 4.2 阶段二：完整功能
 
@@ -1330,12 +1392,15 @@ MVP 不以完整算法效果为目标。
 - doc-service 读取本地文档与任务数据。
 - chat service 使用 Desktop 向量和片段检索结果。
 - Office/OCR/MinerU/PaddleOCR 按线上 API 或降级方式接入。
+- 评估 Python 服务拓扑，优先把 auth-service、parsing、processor、doc-service 中适合共享生命周期的服务合并为 1-2 个 FastAPI 进程；chat service 可因长时间流式推理和模型依赖保持独立。
+- 合并服务必须服从 SQLite ownership 和日志边界，不能为了减少进程数重新引入共享写库或难以诊断的混合日志。
 - Evo 继续不作为主链路阻塞，除非另行提高优先级。
 
 依赖：
 
 - SQLite、Milvus Lite、SegmentStore 本地实现可用。
 - LazyLLM 相关依赖支持 Desktop 运行形态。
+- MVP 启动与资源 smoke 已给出进程数量、冷启动时间和内存占用基线。
 
 #### E. 前端完整体验
 
@@ -1377,6 +1442,7 @@ MVP 不以完整算法效果为目标。
 - RAG 问答。
 - 大文件与批量文件。
 - SQLite 锁竞争。
+- 冷启动时间和内存占用。
 - 后端异常退出恢复。
 - 日志和诊断包完整性。
 
@@ -1395,6 +1461,7 @@ MVP 不以完整算法效果为目标。
 - 用户数据目录与安装目录分离。
 - 升级、卸载、诊断能力可用。
 - Cloud artifact 不受 Desktop 发布链路影响。
+- GitHub CI 可以生成可追溯的 Windows installer artifact，并为后续正式发布打基础。
 
 ### 4.3.2 安装包任务拆分
 
@@ -1473,6 +1540,20 @@ MVP 不以完整算法效果为目标。
 
 - 安装包生成稳定。
 - 后端资源定位稳定。
+
+#### G. GitHub CI 打包发布
+
+- 使用 GitHub Actions 建立 Windows Desktop installer 构建 workflow。
+- workflow 负责构建前端、打包 Electron Main/Preload、编译 Go exe、打包 Python 后端、组装 installer。
+- release tag 或手工 dispatch 可触发产物上传，PR 阶段可只产出临时 artifact。
+- CI 产物需要附带版本号、commit SHA、构建日志和校验和。
+- 签名证书、发布 token、自动更新密钥通过 GitHub Actions Secrets 管理；正式签名和自动更新策略留到后续 LLD 细化。
+
+依赖：
+
+- 安装包本地构建命令稳定。
+- Windows runner 能缓存 npm、Go、Python / uv 依赖并保持可复现。
+- GitHub CI 不影响 Cloud/Server Mode 的现有构建 workflow。
 
 ---
 
@@ -1611,6 +1692,7 @@ MVP 必须建立以下安全基线：
 MVP 可接受：
 
 - RAG 结果是 mock 或弱效果。
+- 默认太阳系 Markdown 示例文档可见，但不要求已经形成真实 RAG 闭环。
 - 模型配置默认是 mock server / mock backend。
 - Chat 中提示用户当前处于 mock 状态，并引导用户到模型配置界面配置真实模型。
 - Office/OCR 能力缺失、走 mock server 或走用户后续配置的线上 API。
@@ -1817,6 +1899,21 @@ C:\Program Files\LazyMind\
 - migration 失败时保留日志和恢复提示。
 - 用户数据应可备份。
 
+#### GitHub CI 打包发布
+
+第三阶段需要建立 GitHub Actions 作为标准打包入口，但本 HLD 不展开完整发布治理。
+
+初步设计：
+
+- 新增独立 Desktop Windows workflow，例如 `desktop-windows.yml`，避免污染 Cloud/Server Mode 的 Docker 构建。
+- 触发方式包括手工 `workflow_dispatch`、release tag、必要时的 PR smoke。
+- Windows runner 执行依赖恢复、前端构建、Electron 打包、Go exe 编译、Python 后端打包和 installer 组装。
+- PR smoke 可以只验证构建链路并上传短期 artifact；release tag 触发的构建上传安装包、校验和和构建元数据。
+- 产物命名包含应用版本、commit SHA、目标平台和架构。
+- workflow 输出构建日志、依赖锁文件摘要、installer SHA256、后端 exe / Python 包版本清单。
+- 签名证书、发布 token、自动更新密钥只通过 GitHub Actions Secrets 注入；MVP/早期第三阶段可以先生成未签名包，正式签名策略在 Windows 安装包 LLD 中细化。
+- CI 缓存 npm、Go、Python / uv 依赖，但缓存命中不能影响构建可复现性。
+
 ### 5.3.3 安装包验收口径
 
 安装包阶段应验证：
@@ -1833,6 +1930,7 @@ C:\Program Files\LazyMind\
 - 卸载行为符合预期。
 - 诊断包可导出。
 - Cloud/Server Mode 构建不受影响。
+- GitHub CI 能生成 Windows installer artifact，并附带校验和、commit SHA 和构建日志。
 
 ---
 
@@ -1869,8 +1967,11 @@ C:\Program Files\LazyMind\
 ## 6.4 数据与中间件
 
 - PostgreSQL -> SQLite。
+- SQLite 默认按服务 ownership 拆分 DB 文件，避免多个后端进程共同写同一个 SQLite 文件。
 - Redis -> Desktop Runtime Store，本地实现不能简单等同于 `sync.Map`。
+- Runtime Store 必须覆盖 Chat 状态、流式片段 replay、取消信号、短生命周期关联记录等 Redis 语义。
 - Milvus -> Milvus Lite，三个阶段都暂定默认使用。
+- Milvus Lite MVP 必须有 Go / No-Go 量化判定。
 - OpenSearch -> 现有 SegmentStore 体系下的 Desktop 本地实现。
 - 暂不并行设计 LanceDB/Qdrant 等替代方案；只有 Milvus Lite MVP 验证不理想时再更新方案。
 
@@ -1904,6 +2005,7 @@ C:\Program Files\LazyMind\
 - Desktop Mode 通过显式开关启用。
 - Cloud 默认行为不变。
 - Desktop 构建和依赖不污染 Cloud 构建。
+- GitHub Actions 可作为第三阶段 Windows installer 的标准打包发布入口。
 - macOS 不是本方案重点，只做低成本预留，不进入 Windows MVP 核心验收。
 
 ---
@@ -2091,6 +2193,36 @@ C:\Program Files\LazyMind\
 - 自动更新使用 HTTPS 和签名校验。
 - 签名证书和发布 token 独立保护。
 
+## 7.14 冷启动与资源占用风险
+
+风险：
+
+- Electron、Go 后端、多个 Python 服务、Milvus Lite、扫描服务同时启动，导致首屏空白或可操作时间过长。
+- Python 打包产物和向量/解析依赖导致内存占用超过普通 Windows 设备预期。
+- 非首屏必需服务阻塞主窗口事件循环，造成用户无法关闭或诊断。
+
+缓解：
+
+- 分层启动，优先展示主窗口、状态和核心入口。
+- Python chat、parsing、processor、scan 等服务异步启动，并在对应功能入口展示 ready / loading / failed 状态。
+- MVP 起记录启动耗时、健康检查耗时和各进程内存占用。
+- 完整功能阶段基于 smoke 数据评估 Python 服务合并和懒启动策略。
+
+## 7.15 GitHub CI 打包发布风险
+
+风险：
+
+- Windows runner、Electron 打包、Go 交叉编译、Python 冻结工具和 Milvus Lite 依赖组合导致 CI 构建不可复现。
+- 签名证书、发布 token、自动更新密钥管理不当导致供应链风险。
+- Desktop installer 构建污染 Cloud/Server Mode 现有 CI。
+
+缓解：
+
+- Desktop Windows workflow 独立于 Cloud/Server Mode workflow。
+- 产物附带 commit SHA、版本号、构建日志、依赖摘要和 SHA256。
+- Secrets 只通过 GitHub Actions Secrets 注入，不写入仓库或日志。
+- PR 阶段只做 smoke artifact，release tag 阶段再执行正式发布路径。
+
 ---
 
 # 8. 后续 LLD 拆分建议
@@ -2109,8 +2241,8 @@ C:\Program Files\LazyMind\
 10. 前端 Desktop Mode / Assistant Switcher LLD。
 11. 扫盘路径选择与权限处理 LLD。
 12. 日志、诊断包、崩溃收集 LLD。
-13. Windows 安装包与升级 LLD。
-14. Cloud/Desktop 双模式 CI LLD。
+13. 启动体验与资源预算 LLD。
+14. Windows 安装包与升级 LLD。
+15. Cloud/Desktop 双模式 CI 与 GitHub Actions 打包发布 LLD。
 
 ---
-
