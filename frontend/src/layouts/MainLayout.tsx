@@ -36,6 +36,7 @@ import {
   isDeveloperModeActive,
   setDeveloperModeActive,
 } from "@/utils/developerMode";
+import { isDesktopMode } from "@/utils/platform";
 import RecordList from "@/modules/chat/components/RecordList";
 import {
   CHAT_RESUME_CONVERSATION_KEY,
@@ -586,7 +587,7 @@ export default function MainLayout() {
     }
   };
 
-  if (!isLoggedIn) {
+  if (!isLoggedIn && !isDesktopMode()) {
     return <Navigate to="/login" replace />;
   }
 

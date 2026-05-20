@@ -1,0 +1,39 @@
+{
+  "name": "lazymind-desktop",
+  "version": "0.1.0",
+  "description": "LazyMind Desktop for Windows",
+  "main": "dist/main/main/index.js",
+  "scripts": {
+    "dev": "npm run build && electron .",
+    "dev:watch": "tsc -p tsconfig.node.json --watch",
+    "build:main": "tsc -p tsconfig.node.json",
+    "build:preload": "tsc -p tsconfig.preload.json",
+    "build": "npm run build:main && npm run build:preload",
+    "build:bundle-main": "esbuild src/main/index.ts --bundle --platform=node --format=cjs --target=node20 --external:electron --outfile=dist/main.js",
+    "build:bundle-preload": "esbuild src/preload/index.ts --bundle --platform=node --format=cjs --target=node20 --external:electron --outfile=dist/preload.js",
+    "build:bundle": "npm run build:bundle-main && npm run build:bundle-preload",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "http-proxy": "^1.18.1",
+    "yaml": "^2.4.5"
+  },
+  "devDependencies": {
+    "@electron/asar": "^3.4.0",
+    "@types/archiver": "^6.0.2",
+    "@types/http-proxy": "^1.17.14",
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.24.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  },
+  "author": "LazyMind",
+  "license": "UNLICENSED"
+}

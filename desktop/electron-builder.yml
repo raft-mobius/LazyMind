@@ -1,0 +1,30 @@
+appId: com.lazymind.desktop
+productName: LazyMind
+copyright: Copyright © 2024 LazyMind
+
+directories:
+  output: release
+  buildResources: resources
+
+files:
+  - dist/**/*
+  - resources/**/*
+  - "!resources/default-docs/**"
+
+extraResources:
+  - from: resources/default-docs
+    to: default-docs
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: resources/icons/icon.ico
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: resources/icons/icon.ico
+  uninstallerIcon: resources/icons/icon.ico

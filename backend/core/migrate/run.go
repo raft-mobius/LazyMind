@@ -15,7 +15,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/glebarez/go-sqlite"
 
 	"lazymind/core/log"
 )
@@ -66,7 +66,18 @@ func RunUp() error {
 		return nil
 	}
 
-	mDir := envOr("MIGRATIONS_DIR", defaultMigrationsDir)
+	mDir := envOr("MIGRATIONS_DIR", "")
+	if mDir == "" {
+		mDir = defaultMigrationsDir
+		if driver == "sqlite" {
+			sqliteDir := filepath.Join(defaultMigrationsDir, "sqlite")
+			if absSD, err2 := filepath.Abs(sqliteDir); err2 == nil {
+				if _, err2 := os.Stat(absSD); err2 == nil {
+					mDir = sqliteDir
+				}
+			}
+		}
+	}
 	absDir, err := filepath.Abs(mDir)
 	if err != nil {
 		return err
@@ -761,7 +772,7 @@ func envOr(key, def string) string {
 func openSQL(driver, dsn string) (*sql.DB, string, error) {
 	switch driver {
 	case "sqlite":
-		db, err := sql.Open("sqlite3", dsn)
+		db, err := sql.Open("sqlite", dsn)
 		if err != nil {
 			return nil, "", err
 		}

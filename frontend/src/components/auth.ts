@@ -103,6 +103,11 @@ export const AgentAppsAuth = {
   },
 
   getAuthHeaders(): Record<string, string> {
+    // In Desktop mode, the local proxy handles identity injection
+    if ((window as any).__DESKTOP_MODE__ || (window as any).lazymind) {
+      return {};
+    }
+
     const userInfo = this.getUserInfo();
     const headers: Record<string, string> = {};
 

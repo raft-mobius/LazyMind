@@ -1,0 +1,43 @@
+{
+  "FixedFileInfo": {
+    "FileVersion": {
+      "Major": 0,
+      "Minor": 1,
+      "Patch": 0,
+      "Build": 0
+    },
+    "ProductVersion": {
+      "Major": 0,
+      "Minor": 1,
+      "Patch": 0,
+      "Build": 0
+    },
+    "FileFlagsMask": "3f",
+    "FileFlags": "",
+    "FileOS": "040004",
+    "FileType": "01",
+    "FileSubType": "00"
+  },
+  "StringFileInfo": {
+    "Comments": "",
+    "CompanyName": "LazyMind",
+    "FileDescription": "LazyMind Desktop",
+    "FileVersion": "0.1.0.0",
+    "InternalName": "LazyMind",
+    "LegalCopyright": "Copyright 2024 LazyMind",
+    "LegalTrademarks": "",
+    "OriginalFilename": "LazyMind.exe",
+    "PrivateBuild": "",
+    "ProductName": "LazyMind",
+    "ProductVersion": "0.1.0.0",
+    "SpecialBuild": ""
+  },
+  "VarFileInfo": {
+    "Translation": {
+      "LangID": "0409",
+      "CharsetID": "04B0"
+    }
+  },
+  "IconPath": "../../resources/icons/icon.ico",
+  "ManifestPath": ""
+}

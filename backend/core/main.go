@@ -26,6 +26,9 @@ import (
 var swaggerUIHTML []byte
 
 func exportOpenAPIArtifacts(openAPIJSON []byte) {
+	if strings.TrimSpace(os.Getenv("LAZYMIND_MODE")) == "desktop" {
+		return
+	}
 	wd, err := os.Getwd()
 	if err != nil {
 		log.Logger.Warn().Err(err).Msg("get working directory failed; skip exporting OpenAPI artifacts")
@@ -177,8 +180,15 @@ func main() {
 
 	go wordgroup.StartPeriodicVocabExtract(context.Background())
 
-	log.Logger.Info().Msg("Core listening on :8000")
-	if err := http.ListenAndServe(":8000", r); err != nil {
+	listenAddr := ":8000"
+	if p := strings.TrimSpace(os.Getenv("SERVER_PORT")); p != "" {
+		listenAddr = ":" + p
+	}
+	if h := strings.TrimSpace(os.Getenv("SERVER_HOST")); h != "" {
+		listenAddr = h + listenAddr
+	}
+	log.Logger.Info().Str("addr", listenAddr).Msg("Core listening")
+	if err := http.ListenAndServe(listenAddr, r); err != nil {
 		log.Logger.Fatal().Err(err).Msg("http listen failed")
 	}
 }

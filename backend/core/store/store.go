@@ -2,6 +2,9 @@
 package store
 
 import (
+	"os"
+	"strings"
+
 	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 
@@ -9,9 +12,10 @@ import (
 )
 
 var (
-	db        *gorm.DB
-	lazyllmDB *gorm.DB
-	rdb       *redis.Client
+	db           *gorm.DB
+	lazyllmDB    *gorm.DB
+	rdb          *redis.Client
+	runtimeStore RuntimeStore
 )
 
 // Init Initializetext DB text Redis，text main textStarttext
@@ -23,6 +27,7 @@ func Init(database, lazyllmDatabase *gorm.DB, redisClient *redis.Client) {
 		lazyllmDB = database
 	}
 	rdb = redisClient
+	runtimeStore = NewRuntimeStore(redisClient)
 }
 
 // DB text *gorm.DB
@@ -39,7 +44,14 @@ func LazyLLMDB() *gorm.DB {
 // Redis text *redis.Client，text nil（text）
 func Redis() *redis.Client { return rdb }
 
+// Runtime returns the RuntimeStore instance (memory or Redis based on config).
+func Runtime() RuntimeStore { return runtimeStore }
+
 // MustRedisFromEnv textCreate Redis text Ping，Failedtext panic，text main Initializetext
+// Returns nil when LAZYMIND_STATE_BACKEND=memory (no Redis needed).
 func MustRedisFromEnv() *redis.Client {
+	if strings.TrimSpace(os.Getenv("LAZYMIND_STATE_BACKEND")) == "memory" {
+		return nil
+	}
 	return common.MustRedisFromEnv()
 }

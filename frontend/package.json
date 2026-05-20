@@ -12,7 +12,9 @@
     "gen:openapi": "node scripts/openapi/generate-api.mjs",
     "gen:openapi:check": "node scripts/openapi/check-stale.mjs",
     "gen:auth": "bash scripts/openapi/generate-auth.sh",
-    "lint": "eslint \"src/**/*.{ts,tsx}\""
+    "lint": "eslint \"src/**/*.{ts,tsx}\"",
+    "dev:desktop": "cross-env VITE_LAZYMIND_MODE=desktop vite --clearScreen false",
+    "build:desktop": "cross-env VITE_LAZYMIND_MODE=desktop vite build"
   },
   "dependencies": {
     "@ant-design/icons": "5.x",

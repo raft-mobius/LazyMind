@@ -283,4 +283,10 @@ app.include_router(user_router, prefix=_API_PREFIX)
 app.include_router(role_router, prefix=_API_PREFIX)
 app.include_router(group_router, prefix=_API_PREFIX)
 
+# Desktop mode: register desktop-specific endpoints (assistant management, bootstrap, identity)
+import os as _os
+if (_os.environ.get('LAZYMIND_MODE') or '').strip().lower() == 'desktop':
+    from desktop import router as desktop_router
+    app.include_router(desktop_router, prefix=_API_PREFIX)
+
 _export_openapi_artifacts()

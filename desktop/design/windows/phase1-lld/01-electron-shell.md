@@ -826,3 +826,155 @@ Cloud 模式继续使用 Docker + Nginx 服务前端，不受影响。
 - [ ] IPC 通道 `dialog:pickFolder` 可打开文件夹选择对话框。
 - [ ] BrowserWindow 安全配置符合要求（DevTools 中验证 CSP、nodeIntegration 等）。
 - [ ] 关闭主窗口时应用退出。
+- [ ] 窗口无菜单栏（File/Edit/View/Window/Help 完全不显示）。
+- [ ] Ctrl+C/V/X/A 等剪贴板快捷键仍可用。
+- [ ] 开发包启动器 `LazyMind.exe` 双击不弹出控制台窗口。
+- [ ] `LazyMind.exe` 文件属性中显示 LazyMind 图标。
+
+---
+
+## 12. 菜单栏移除
+
+### 12.1 方案
+
+在 `desktop/src/main/index.ts` 的 `bootstrap()` 函数中，`app.whenReady()` 之后立即移除默认菜单：
+
+```typescript
+import { app, protocol, Menu } from 'electron';
+
+async function bootstrap(): Promise<void> {
+  // ...
+  await app.whenReady();
+  Menu.setApplicationMenu(null);
+  // ...
+}
+```
+
+### 12.2 方案选型理由
+
+| 方案 | 效果 | 不采用原因 |
+|------|------|-----------|
+| `Menu.setApplicationMenu(null)` | 完全移除菜单栏 | **采用** |
+| `autoHideMenuBar: true` | 默认隐藏，按 Alt 闪现 | 按 Alt 会意外出现菜单，用户困惑 |
+| `frame: false` | 无边框窗口 | 失去标题栏和系统窗口控制按钮，需自定义实现 |
+
+### 12.3 键盘快捷键兼容
+
+移除菜单栏后，以下快捷键不受影响（由 Chromium Renderer 层原生处理）：
+- Ctrl+C / Ctrl+V / Ctrl+X — 剪贴板操作
+- Ctrl+A — 全选
+- Ctrl+Z / Ctrl+Y — 撤销/重做
+- Tab / Shift+Tab — 焦点切换
+
+---
+
+## 13. 开发包启动器（LazyMind.exe）
+
+### 13.1 目标
+
+用带有 LazyMind 懒猫图标的 exe 文件替代 `LazyMind.bat`，消除用户双击时出现的 cmd 终端窗口。
+
+### 13.2 技术方案
+
+使用 Go 编写一个微型启动器 `desktop/cmd/launcher/main.go`：
+
+- **隐藏控制台：** 编译标志 `-ldflags "-H=windowsgui"` 使可执行文件不显示控制台窗口。
+- **嵌入图标：** 使用 `goversioninfo` 工具将 `.ico` 图标和 Windows 版本信息嵌入 exe。
+- **启动逻辑：** 等同于原 bat 文件，但子进程使用 `CREATE_NO_WINDOW` 标志启动。
+
+### 13.3 启动流程
+
+```text
+LazyMind.exe 启动
+  │
+  ├─ 1. 确定自身所在目录（exeDir）
+  ├─ 2. 设置环境变量：
+  │     ACL_DB_DRIVER=sqlite
+  │     ACL_DB_DSN={exeDir}/data/main.db
+  │     LAZYMIND_STATE_BACKEND=memory
+  │     LAZYMIND_MODE=desktop
+  │     LAZYMIND_JWT_SECRET=lazymind-desktop-local-dev
+  │     SERVER_PORT=8001
+  │     SERVER_HOST=127.0.0.1
+  │
+  ├─ 3. 启动 bin/core.exe（CREATE_NO_WINDOW，隐藏窗口）
+  │
+  ├─ 4. 轮询 http://127.0.0.1:8001/health（30s 超时）
+  │
+  ├─ 5. 设置额外环境变量：
+  │     ELECTRON_RENDERER_DIR={exeDir}/renderer
+  │     LAZYMIND_DEV_MODE=true
+  │
+  ├─ 6. 启动 electron/electron.exe app/（隐藏子进程控制台）
+  │
+  ├─ 7. 等待 Electron 进程退出
+  │
+  └─ 8. 清理：taskkill /T /F /PID {core_pid}
+```
+
+### 13.4 目录结构
+
+```
+desktop/
+├── cmd/
+│   └── launcher/
+│       ├── main.go              # 启动器源码
+│       └── versioninfo.json     # goversioninfo 配置（图标、版本信息）
+├── resources/
+│   └── icons/
+│       ├── icon.ico             # Windows 多分辨率图标 (16/32/48/256)
+│       └── icon.png             # 通用图标 (256x256)
+```
+
+### 13.5 构建命令
+
+```bash
+# 安装 goversioninfo（首次）
+go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest
+
+# 生成 Windows 资源文件
+cd desktop/cmd/launcher && go generate
+
+# 编译（无控制台窗口、去调试符号）
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
+  -ldflags "-H=windowsgui -s -w" \
+  -o ~/LazyMind_dev/LazyMind.exe .
+```
+
+### 13.6 goversioninfo 配置
+
+```json
+{
+  "FixedFileInfo": {
+    "FileVersion": {"Major": 0, "Minor": 1, "Patch": 0, "Build": 0},
+    "ProductVersion": {"Major": 0, "Minor": 1, "Patch": 0, "Build": 0},
+    "FileType": "App"
+  },
+  "StringFileInfo": {
+    "FileDescription": "LazyMind Desktop",
+    "ProductName": "LazyMind",
+    "CompanyName": "LazyMind",
+    "InternalName": "LazyMind",
+    "OriginalFilename": "LazyMind.exe",
+    "LegalCopyright": "Copyright 2024 LazyMind"
+  },
+  "IconPath": "../../resources/icons/icon.ico",
+  "ManifestPath": ""
+}
+```
+
+### 13.7 与安装包阶段的关系
+
+| 阶段 | 启动方式 | 说明 |
+|------|----------|------|
+| 开发包 | Go launcher `LazyMind.exe` | 本章方案，管理 core.exe + Electron |
+| 安装包 | electron-builder `LazyMind.exe` | electron-builder 产出的 Electron 本体，Process Manager 管理所有后端 |
+
+开发包阶段 Go launcher 仅为过渡方案。安装包阶段 Electron 本身就是 exe 入口，Process Manager 负责启动全部后端服务，不再需要外部 launcher。
+
+### 13.8 安全考量
+
+- 子进程使用数组参数启动，不拼接 shell 字符串。
+- 可执行路径仅从 exeDir 的固定子路径解析，不接受用户输入。
+- 环境变量采用白名单方式设置。
+- core.exe 不以管理员权限运行。

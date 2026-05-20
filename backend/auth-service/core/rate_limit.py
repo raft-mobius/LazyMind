@@ -1,6 +1,7 @@
 """
 Login failure rate limiting (deny login for a period after N consecutive failures on the same account)
 """
+import os
 import time
 import redis
 
@@ -8,6 +9,8 @@ from core.redis_client import redis_client
 
 LOGIN_MAX_ATTEMPTS = 3
 LOGIN_TIME_WINDOW_SECONDS = 60
+
+_USE_MEMORY = (os.environ.get('LAZYMIND_STATE_BACKEND') or '').strip().lower() == 'memory'
 
 
 class LoginRateLimiter:
@@ -42,7 +45,6 @@ class LoginRateLimiter:
             except (TypeError, ValueError):
                 return False
         except redis.RedisError:
-            # Do not block login when Redis is unavailable (only lose rate-limit protection)
             return False
 
     def record_failure(self, user_id: int | str) -> None:
@@ -60,4 +62,11 @@ class LoginRateLimiter:
             return
 
 
-login_rate_limiter = LoginRateLimiter()
+def _create_rate_limiter():
+    if _USE_MEMORY:
+        from core.noop_rate_limiter import NoOpRateLimiter
+        return NoOpRateLimiter()
+    return LoginRateLimiter()
+
+
+login_rate_limiter = _create_rate_limiter()

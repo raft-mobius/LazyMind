@@ -3,9 +3,9 @@ package orm
 import (
 	"fmt"
 
+	"github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
 	"lazymind/core/log"
@@ -40,7 +40,21 @@ func Connect(driver, dsn string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	if driver == DriverSQLite {
+		configureSQLite(db)
+	}
 	return &DB{DB: db}, nil
+}
+
+func configureSQLite(db *gorm.DB) {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return
+	}
+	sqlDB.Exec("PRAGMA journal_mode=WAL")
+	sqlDB.Exec("PRAGMA busy_timeout=5000")
+	sqlDB.Exec("PRAGMA foreign_keys=ON")
+	sqlDB.Exec("PRAGMA synchronous=NORMAL")
 }
 
 // MustConnect text，Failedtext Fatal Logtext，text main text。

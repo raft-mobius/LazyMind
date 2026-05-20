@@ -26,6 +26,9 @@ function jsPreviewExcelShimPlugin(): Plugin {
 export default defineConfig({
   plugins: [jsPreviewExcelShimPlugin(), react(), svgr()],
   base: "/",
+  define: {
+    __DESKTOP_MODE__: JSON.stringify(process.env.VITE_LAZYMIND_MODE === "desktop"),
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "src"),

@@ -1,0 +1,25 @@
+server:
+  proxy_port: 5023
+  host: "127.0.0.1"
+
+services:
+  core:
+    port: 8001
+  auth_service:
+    port: 8002
+  scan_control_plane:
+    port: 18080
+  file_watcher:
+    port: 18081
+  algorithm_mock:
+    port: 8046
+
+model:
+  provider: "mock"
+  api_key: ""
+  base_url: ""
+
+logging:
+  level: "info"
+  max_file_size_mb: 10
+  max_files: 5
