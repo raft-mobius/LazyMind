@@ -17,7 +17,7 @@ export function getDefaultRoutes(): ProxyRoute[] {
     },
     {
       prefix: '/api/chat',
-      target: `http://127.0.0.1:${SERVICE_PORTS.algorithmMock}`,
+      target: `http://127.0.0.1:${SERVICE_PORTS.algorithmService}`,
       stripPrefix: false,
       timeout: 600000,
     },
@@ -32,6 +32,12 @@ export function getDefaultRoutes(): ProxyRoute[] {
       target: `http://127.0.0.1:${SERVICE_PORTS.fileWatcher}`,
       stripPrefix: false,
       timeout: 30000,
+    },
+    {
+      prefix: '/internal/credentials',
+      target: '', // Handled by credential bridge, not proxied
+      stripPrefix: false,
+      timeout: 5000,
     },
   ];
 }

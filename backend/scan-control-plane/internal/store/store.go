@@ -283,6 +283,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		&sourceFileSnapshotItemEntity{},
 		&sourceSnapshotRelationEntity{},
 		&manualPullJobEntity{},
+		&scanPathEntity{},
 	); err != nil {
 		return err
 	}

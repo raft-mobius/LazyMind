@@ -1,0 +1,5 @@
+DROP TRIGGER IF EXISTS segments_au;
+DROP TRIGGER IF EXISTS segments_ad;
+DROP TRIGGER IF EXISTS segments_ai;
+DROP TABLE IF EXISTS segments_fts;
+DROP TABLE IF EXISTS segments;

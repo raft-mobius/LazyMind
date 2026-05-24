@@ -28,6 +28,14 @@ const api: LazyMindDesktopAPI = {
       ipcRenderer.removeListener(IPC_CHANNELS.SERVICE_STATUS_CHANGED, handler);
     };
   },
+  setCredential: (service: string, account: string, secret: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.CREDENTIAL_SET, service, account, secret),
+  getCredential: (service: string, account: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.CREDENTIAL_GET, service, account),
+  deleteCredential: (service: string, account: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.CREDENTIAL_DELETE, service, account),
+  listCredentials: (service: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.CREDENTIAL_LIST, service),
 };
 
 contextBridge.exposeInMainWorld('lazymind', api);

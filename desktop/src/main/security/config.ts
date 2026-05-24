@@ -35,6 +35,10 @@ export const SECURITY_CONFIG = {
     'diagnostics:export',
     'logs:open',
     'data:getDir',
+    'credential:set',
+    'credential:get',
+    'credential:delete',
+    'credential:list',
   ] as const,
 
   localBind: '127.0.0.1' as const,

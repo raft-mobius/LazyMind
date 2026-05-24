@@ -14,6 +14,10 @@ export const IPC_CHANNELS = {
   DIAGNOSTICS_EXPORT: 'diagnostics:export',
   LOGS_OPEN: 'logs:open',
   DATA_GET_DIR: 'data:getDir',
+  CREDENTIAL_SET: 'credential:set',
+  CREDENTIAL_GET: 'credential:get',
+  CREDENTIAL_DELETE: 'credential:delete',
+  CREDENTIAL_LIST: 'credential:list',
 } as const;
 
 export type IPCChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

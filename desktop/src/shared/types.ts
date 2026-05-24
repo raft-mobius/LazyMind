@@ -118,4 +118,8 @@ export interface LazyMindDesktopAPI {
   isPackaged(): boolean;
   getMode(): 'desktop';
   onServiceStatusChanged(callback: (status: ServiceStatus) => void): () => void;
+  setCredential(service: string, account: string, secret: string): Promise<void>;
+  getCredential(service: string, account: string): Promise<string | null>;
+  deleteCredential(service: string, account: string): Promise<void>;
+  listCredentials(service: string): Promise<string[]>;
 }

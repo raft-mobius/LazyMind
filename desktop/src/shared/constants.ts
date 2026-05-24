@@ -10,6 +10,8 @@ export const SERVICE_PORTS = {
   core: 8001,
   scanControlPlane: 18080,
   fileWatcher: 18081,
+  algorithmService: 8046,
+  /** @deprecated Use algorithmService */
   algorithmMock: 8046,
 } as const;
 

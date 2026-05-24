@@ -29,6 +29,9 @@ import MemoryExperienceDetailPage from "@/modules/memory/pages/experienceDetail"
 import ModelProviderPage from "@/modules/admin/pages/modelProvider";
 import { SelfEvolutionHomePage, SelfEvolutionDetailPage } from "@/modules/selfEvolution";
 import { getAntdLocale } from "@/i18n/antdLocale";
+import AssistantManagement from "@/modules/assistants/AssistantManagement";
+import ModelConfigDesktop from "@/modules/model-providers/ModelConfigDesktop";
+import { DesktopOnlyRoute } from "./guards";
 
 export default function AppRouter() {
   const { i18n } = useTranslation();
@@ -89,6 +92,8 @@ export default function AppRouter() {
           <Route path="self-evolution" element={<SelfEvolutionHomePage />} />
           <Route path="self-evolution/detail/:threadId" element={<SelfEvolutionDetailPage />} />
           <Route path="self-evolution/:threadId" element={<SelfEvolutionDetailPage />} />
+          <Route path="assistants" element={<DesktopOnlyRoute><AssistantManagement /></DesktopOnlyRoute>} />
+          <Route path="desktop/model-config" element={<DesktopOnlyRoute><ModelConfigDesktop /></DesktopOnlyRoute>} />
         </Route>
         <Route path="/admin" element={<AdminLayout />}>
           <Route index element={<Navigate to="groups" replace />} />
